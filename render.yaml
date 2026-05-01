@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-takeoff-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-4-6
+    disk:
+      name: lessons-data
+      mountPath: /data
+      sizeGB: 1

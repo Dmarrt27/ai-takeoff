@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Takeoff - Concrete Quantity Extraction</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;600;700;800&family=Nunito:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --primary:        #E8611A;
+            --primary-dark:   #C04D10;
+            --primary-light:  #F5A45D;
+            --primary-wash:   #FEF3EA;
+            --primary-wash2:  #FDE9D4;
+            --black:          #1A1210;
+            --dark:           #2C2018;
+            --dark-mid:       #4A3428;
+            --fg1:            #2C2018;
+            --fg2:            #6B5744;
+            --fg3:            #9C8778;
+            --bg:             #F5EFE8;
+            --surface:        #FFFFFF;
+            --border:         #E8DDD4;
+            --border-strong:  #BFB0A4;
+            --amber:          #F0A500;
+            --amber-bg:       #FFF8E8;
+            --success:        #2D8A4E;
+            --success-bg:     #D4F0DF;
+            --error:          #C0392B;
+            --error-bg:       #FDECEA;
+            --shadow-sm:      0 2px 8px rgba(44,32,24,0.08), 0 1px 2px rgba(44,32,24,0.04);
+            --shadow-md:      0 4px 20px rgba(44,32,24,0.10), 0 2px 6px rgba(44,32,24,0.06);
+            --shadow-lg:      0 8px 40px rgba(44,32,24,0.14), 0 2px 8px rgba(44,32,24,0.06);
+            --font-display:   'Barlow Semi Condensed', sans-serif;
+            --font-body:      'Nunito', sans-serif;
+            --font-mono:      'JetBrains Mono', monospace;
+            --radius-md:      8px;
+            --radius-lg:      12px;
+            --radius-xl:      16px;
+        }
+
+        body {
+            font-family: var(--font-body);
+            background: var(--bg);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header ─────────────────────────────────────── */
+        .app-header {
+            background: #1A1210;
+            padding: 0 32px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            flex-shrink: 0;
+        }
+        .logo-wrap { display: flex; align-items: center; gap: 0; text-decoration: none; }
+        .logo-mark {
+            background: var(--primary); border-radius: 10px 0 0 10px;
+            width: 48px; height: 48px;
+            display: flex; align-items: center; justify-content: center;
+            font-family: var(--font-display); font-weight: 900; font-size: 20px;
+            color: #fff; letter-spacing: -0.5px; flex-shrink: 0;
+        }
+        .logo-text {
+            background: #2C2018;
+            border-radius: 0 10px 10px 0;
+            padding: 0 16px; height: 48px;
+            display: flex; flex-direction: column;
+            justify-content: center; gap: 1px;
+        }
+        .logo-title { font-family: var(--font-display); font-weight: 800; font-size: 20px; color: #FEFCF8; letter-spacing: 0.02em; line-height: 1; }
+        .logo-sub { font-family: var(--font-body); font-size: 9px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg3); }
+        .header-avatar {
+            width: 34px; height: 34px; border-radius: 50%;
+            background: linear-gradient(135deg, #E8611A, #C04D10);
+            display: flex; align-items: center; justify-content: center;
+            font-family: var(--font-display); font-weight: 800; font-size: 13px;
+            color: #fff; letter-spacing: 0.02em;
+        }
+        /* ── Sub-nav ──────────────────────────────────────── */
+        .app-subnav {
+            background: #2C2018;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            padding: 0 32px;
+            display: flex; align-items: center; gap: 0; height: 42px;
+            flex-shrink: 0;
+        }
+        .subnav-btn {
+            background: transparent; border: none;
+            border-bottom: 2px solid transparent;
+            padding: 0 18px; height: 42px;
+            font-family: var(--font-body); font-size: 13px; font-weight: 700;
+            color: #6B5744; cursor: pointer; transition: all 0.15s;
+            letter-spacing: 0.02em;
+        }
+        .subnav-btn:hover { color: #BFB0A4; }
+        .subnav-btn.active { color: #FEFCF8; border-bottom-color: var(--primary); }
+
+        /* ── Main layout ─────────────────────────────────── */
+        .page-wrap {
+            flex: 1;
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 36px 24px 48px;
+            width: 100%;
+        }
+
+        /* ── Section heading ─────────────────────────────── */
+        .page-intro { text-align: center; margin-bottom: 28px; }
+        .page-intro h1 { font-family: var(--font-display); font-size: 36px; font-weight: 800; color: var(--fg1); letter-spacing: -0.5px; margin-bottom: 6px; }
+        .page-intro p  { font-family: var(--font-body); font-size: 15px; color: var(--fg2); }
+
+        /* ── Upload section ──────────────────────────────── */
+        .upload-section {
+            background: var(--surface);
+            border: 2.5px dashed var(--primary);
+            border-radius: var(--radius-xl);
+            padding: 48px 40px;
+            text-align: center;
+            margin-bottom: 28px;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        .upload-section.drag-over {
+            background: var(--primary-wash);
+            border-color: var(--primary-dark);
+            transform: scale(1.012);
+        }
+        .upload-icon-wrap {
+            width: 60px; height: 60px;
+            background: var(--primary-wash);
+            border-radius: 14px;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 18px;
+        }
+        .upload-icon-wrap svg { color: var(--primary); }
+        .upload-title { font-family: var(--font-display); font-size: 22px; font-weight: 700; color: var(--fg1); margin-bottom: 6px; }
+        .upload-hint  { font-family: var(--font-body); font-size: 13px; color: var(--fg3); margin-bottom: 22px; }
+        #fileInput { display: none; }
+        .btn-row { display: flex; gap: 10px; justify-content: center; }
+        .upload-button {
+            background: var(--primary); color: #fff; border: none;
+            padding: 11px 26px; border-radius: var(--radius-md);
+            font-family: var(--font-body); font-size: 14px; font-weight: 700;
+            cursor: pointer; transition: all 0.2s;
+            box-shadow: 0 2px 10px rgba(232,97,26,0.28);
+        }
+        .upload-button:hover { background: var(--primary-dark); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(232,97,26,0.35); }
+        .demo-button {
+            background: transparent; color: var(--primary);
+            border: 1.5px solid var(--primary);
+            padding: 11px 26px; border-radius: var(--radius-md);
+            font-family: var(--font-body); font-size: 14px; font-weight: 700;
+            cursor: pointer; transition: all 0.2s;
+        }
+        .demo-button:hover { background: var(--primary-wash); }
+        .filename-display { color: var(--fg3); font-size: 12px; margin-top: 14px; font-weight: 500; }
+
+        /* ── How it works ────────────────────────────────── */
+        .how-it-works { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; margin-bottom: 28px; }
+        .how-card { background: var(--surface); border-radius: var(--radius-lg); padding: 18px 20px; box-shadow: var(--shadow-sm); }
+        .how-num  { font-family: var(--font-display); font-size: 28px; font-weight: 800; color: var(--primary); margin-bottom: 4px; }
+        .how-title{ font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--fg1); margin-bottom: 5px; }
+        .how-desc { font-family: var(--font-body); font-size: 12px; color: var(--fg2); line-height: 1.55; }
+
+        /* ── Loading ─────────────────────────────────────── */
+        .loading {
+            display: none; text-align: center; padding: 44px 40px;
+            background: var(--primary-wash); border-radius: var(--radius-xl);
+            margin-bottom: 28px;
+        }
+        .spinner {
+            border: 3px solid var(--primary-wash2);
+            border-top: 3px solid var(--primary);
+            border-radius: 50%; width: 44px; height: 44px;
+            animation: spin 0.9s linear infinite; margin: 0 auto 18px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-title { font-family: var(--font-display); font-size: 20px; font-weight: 700; color: var(--fg1); margin-bottom: 6px; }
+        .loading-hint  { font-family: var(--font-body); font-size: 13px; color: var(--fg3); }
+
+        /* ── Results ─────────────────────────────────────── */
+        .results-section { display: none; }
+
+        .results-topbar {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+        }
+        .results-topbar-title { font-family: var(--font-display); font-size: 22px; font-weight: 700; color: var(--fg1); }
+        .results-topbar-meta  { font-family: var(--font-body); font-size: 12px; color: var(--fg3); margin-top: 2px; }
+        .topbar-actions { display: flex; gap: 8px; }
+
+        /* Summary card */
+        .summary-card {
+            background: var(--primary);
+            color: #fff; padding: 30px 36px;
+            border-radius: var(--radius-xl);
+            margin-bottom: 16px; text-align: center;
+            position: relative; overflow: hidden;
+        }
+        .summary-card::before {
+            content: ''; position: absolute; top: -24px; right: -24px;
+            width: 130px; height: 130px; border-radius: 50%;
+            background: rgba(255,255,255,0.07);
+        }
+        .summary-card::after {
+            content: ''; position: absolute; bottom: -32px; left: -12px;
+            width: 100px; height: 100px; border-radius: 50%;
+            background: rgba(0,0,0,0.07);
+        }
+        .summary-label { font-family: var(--font-body); font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; opacity: 0.82; margin-bottom: 8px; }
+        .summary-value { font-family: var(--font-mono); font-size: 52px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; margin-bottom: 4px; }
+        .summary-unit  { font-family: var(--font-body); font-size: 14px; opacity: 0.85; }
+        .summary-delta {
+            display: inline-block; background: rgba(255,255,255,0.18);
+            border-radius: 20px; padding: 5px 16px; margin-top: 12px;
+            font-family: var(--font-body); font-size: 12px; font-weight: 600;
+            opacity: 0; transition: opacity 0.3s;
+        }
+        .summary-delta.visible { opacity: 1; }
+
+        /* Rating */
+        .rating-section {
+            display: none; background: var(--surface); border-radius: var(--radius-lg);
+            padding: 14px 20px; margin-bottom: 14px; text-align: center;
+            box-shadow: var(--shadow-sm);
+            align-items: center; gap: 16px; justify-content: center; flex-wrap: wrap;
+        }
+        .rating-label { font-family: var(--font-body); font-size: 13px; font-weight: 600; color: var(--fg1); }
+        .stars { font-size: 24px; cursor: pointer; letter-spacing: 4px; color: var(--border); user-select: none; }
+        .star.active { color: var(--amber); }
+        .star.hover  { color: var(--amber); }
+        .rating-hint { font-family: var(--font-body); font-size: 12px; color: var(--fg3); }
+
+        /* Meta */
+        .meta-line { font-family: var(--font-body); font-size: 12px; color: var(--fg3); text-align: center; margin-bottom: 14px; }
+
+        /* Legend */
+        .table-legend {
+            font-size: 12px; color: var(--fg3); margin-bottom: 10px;
+            display: flex; align-items: center; gap: 8px; font-family: var(--font-body);
+        }
+        .legend-swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+        .legend-uncertain { background: var(--amber-bg); border: 1px solid var(--amber); }
+
+        /* Table wrapper */
+        .table-wrap { background: var(--surface); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 16px; box-shadow: var(--shadow-sm); }
+        .table-wrap-header { padding: 14px 18px 10px; font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--fg1); border-bottom: 1px solid var(--border); }
+
+        /* Elements table */
+        .elements-table { width: 100%; border-collapse: collapse; }
+        .elements-table th {
+            background: #F5EFE8; padding: 10px 10px; text-align: left;
+            border-bottom: 2px solid var(--border); font-family: var(--font-body);
+            font-size: 11px; font-weight: 700; color: var(--fg2);
+            text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap;
+        }
+        .elements-table td { padding: 10px 10px; border-bottom: 1px solid #F5EFE8; vertical-align: middle; font-family: var(--font-body); font-size: 13px; color: var(--fg1); }
+        .elements-table tr:hover td { background: #FEFAF7; }
+        .elements-table input[type="number"],
+        .elements-table span[contenteditable] {
+            border: none; background: transparent;
+            font-family: var(--font-mono); font-size: 12px; color: var(--dark-mid);
+            width: 100%; padding: 0; outline: none; cursor: text;
+        }
+        .elements-table input[type="number"]:focus,
+        .elements-table span[contenteditable]:focus {
+            background: var(--amber-bg); border-bottom: 2px solid var(--primary);
+            border-radius: 2px; padding: 0 2px;
+        }
+        .elements-table input[type="number"] { width: 62px; }
+        .dim-sep { color: var(--border-strong); margin: 0 2px; }
+        .row-edited { border-left: 3px solid var(--amber); }
+        .row-edited td:first-child { padding-left: 7px; }
+        .computed-cell { font-family: var(--font-mono); font-size: 12px; color: var(--fg2); }
+        .cy-cell { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--primary); }
+        .cy-cell.edited { color: var(--amber); }
+
+        /* Uncertainty */
+        .row-uncertain td { background: var(--amber-bg); }
+        .row-uncertain:hover td { background: #FFF3CC !important; }
+        .uncertain-icon { color: var(--amber); font-size: 11px; vertical-align: super; margin-left: 3px; }
+
+        /* Flag buttons */
+        .flag-cell { white-space: nowrap; }
+        .flag-btn {
+            background: #fff; border: 1.5px solid var(--border); border-radius: 5px;
+            cursor: pointer; padding: 3px 9px; font-size: 11px; font-weight: 700;
+            font-family: var(--font-body); transition: all 0.15s; margin: 0 2px;
+        }
+        .flag-btn:hover { border-color: var(--border-strong); }
+        .flag-btn.active.correct   { background: var(--success-bg); color: #1A5C35; border-color: var(--success); }
+        .flag-btn.active.incorrect { background: var(--error-bg); color: #7A1F18; border-color: var(--error); }
+
+        /* Diff panel */
+        .diff-panel {
+            background: #F5EFE8; border: 1px solid var(--border);
+            border-radius: var(--radius-lg); padding: 20px;
+            margin-bottom: 16px; display: none;
+        }
+        .diff-title { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--dark-mid); margin-bottom: 14px; letter-spacing: 0.02em; }
+        .diff-columns { display: flex; gap: 24px; }
+        .diff-col { flex: 1; min-width: 0; }
+        .diff-col h4 { font-family: var(--font-body); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 2px solid; }
+        .diff-col.diff-ai   h4 { border-color: var(--primary);  color: var(--primary); }
+        .diff-col.diff-user h4 { border-color: var(--success); color: var(--success); }
+        .diff-row { padding: 4px 0; font-family: var(--font-body); font-size: 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 8px; }
+        .diff-row.changed   { font-weight: 700; color: var(--fg1); }
+        .diff-row.unchanged { color: var(--border-strong); }
+        .diff-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+        .diff-row-val  { flex-shrink: 0; font-family: var(--font-mono); font-size: 11px; }
+        .diff-total { margin-top: 10px; font-weight: 700; font-size: 13px; font-family: var(--font-body); padding-top: 6px; border-top: 2px solid var(--border); color: var(--fg1); }
+        .diff-delta { text-align: center; margin-top: 12px; font-size: 13px; font-weight: 700; font-family: var(--font-body); }
+        .diff-delta.positive { color: var(--success); }
+        .diff-delta.negative { color: var(--error); }
+        .diff-delta.zero     { color: var(--fg3); }
+
+        /* Assumptions */
+        .assumptions {
+            background: var(--primary-wash); border-left: 3px solid var(--primary);
+            border-radius: 0 var(--radius-md) var(--radius-md) 0;
+            padding: 16px 20px; margin-bottom: 24px;
+        }
+        .assumptions h3 { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--fg1); margin-bottom: 8px; letter-spacing: 0.02em; }
+        .assumptions ul { margin-left: 18px; }
+        .assumptions li { font-family: var(--font-body); font-size: 13px; color: var(--fg2); line-height: 1.65; }
+
+        /* Action buttons */
+        .action-buttons { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+        .btn {
+            padding: 11px 26px; border: none; border-radius: var(--radius-md);
+            cursor: pointer; font-family: var(--font-body); font-size: 14px; font-weight: 700;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(232,97,26,0.28); }
+        .btn-primary:hover { background: var(--primary-dark); transform: translateY(-1px); }
+        .btn-feedback { background: var(--success); color: #fff; }
+        .btn-feedback:hover { background: #226A3C; transform: translateY(-1px); }
+        .btn-secondary { background: #F5EFE8; color: var(--fg1); border: 1.5px solid var(--border); }
+        .btn-secondary:hover { background: var(--border); }
+
+        /* Messages */
+        .msg { padding: 12px 18px; border-radius: var(--radius-md); margin-bottom: 16px; font-family: var(--font-body); font-size: 13px; font-weight: 600; }
+        .error   { background: var(--error-bg); color: #7A1F18; border-left: 3px solid var(--error); }
+        .success { background: var(--success-bg); color: #1A5C35; border-left: 3px solid var(--success); }
+
+        /* ── Feedback Notes ──────────────────────────────── */
+        .feedback-notes-section {
+            background: var(--surface);
+            border-radius: var(--radius-lg);
+            padding: 20px 24px;
+            margin-bottom: 14px;
+            box-shadow: var(--shadow-sm);
+        }
+        .feedback-notes-header {
+            display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+        }
+        .feedback-notes-title {
+            font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--fg1);
+        }
+        .feedback-notes-hint {
+            font-family: var(--font-body); font-size: 12px; color: var(--fg3); margin-bottom: 12px;
+        }
+        .feedback-notes-textarea {
+            width: 100%; min-height: 72px; resize: vertical;
+            border: 1.5px solid var(--border); border-radius: var(--radius-md);
+            padding: 10px 14px; font-family: var(--font-body); font-size: 13px;
+            color: var(--fg1); background: var(--bg); line-height: 1.6;
+            transition: border-color 0.2s;
+            outline: none;
+        }
+        .feedback-notes-textarea::placeholder { color: var(--fg3); }
+        .feedback-notes-textarea:focus { border-color: var(--primary); background: var(--surface); }
+        .feedback-notes-char { font-family: var(--font-mono); font-size: 11px; color: var(--fg3); text-align: right; margin-top: 5px; }
+
+        /* Per-row correction note */
+        .correction-note-row { display: none; }
+        .correction-note-row td {
+            padding: 0 10px 8px 10px !important;
+            background: var(--error-bg) !important;
+            border-bottom: 1px solid var(--border) !important;
+        }
+        .correction-note-input {
+            width: 100%; border: 1.5px solid var(--error); border-radius: 5px;
+            padding: 6px 10px; font-family: var(--font-body); font-size: 12px;
+            color: var(--fg1); background: #fff; outline: none; resize: none;
+            transition: border-color 0.2s;
+        }
+        .correction-note-input::placeholder { color: #C0392B; opacity: 0.55; }
+        .correction-note-input:focus { border-color: var(--primary-dark); }
+
+        /* ── History ─────────────────────────────────────── */
+        .history-card {
+            background: var(--surface); border-radius: var(--radius-lg);
+            padding: 18px 22px; margin-bottom: 12px; box-shadow: var(--shadow-sm);
+            display: flex; align-items: center; gap: 20px;
+            cursor: pointer; transition: all 0.15s;
+            border: 1.5px solid transparent;
+        }
+        .history-card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); border-color: var(--primary-light); }
+        .history-card-icon {
+            width: 44px; height: 44px; background: var(--primary-wash); border-radius: 10px;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .history-card-body { flex: 1; min-width: 0; }
+        .history-card-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; color: var(--fg1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .history-card-meta { font-family: var(--font-body); font-size: 12px; color: var(--fg3); margin-top: 3px; }
+        .history-card-stat { text-align: right; flex-shrink: 0; }
+        .history-card-stat-val { font-family: var(--font-mono); font-size: 22px; font-weight: 700; color: var(--primary); line-height: 1; }
+        .history-card-stat-label { font-family: var(--font-body); font-size: 11px; color: var(--fg3); margin-top: 2px; }
+        .history-empty {
+            text-align: center; padding: 60px 24px;
+            background: var(--surface); border-radius: var(--radius-xl);
+            border: 2px dashed var(--border);
+        }
+        .history-empty-icon { font-size: 40px; margin-bottom: 16px; opacity: 0.4; }
+        .history-empty-title { font-family: var(--font-display); font-size: 20px; font-weight: 700; color: var(--fg2); margin-bottom: 8px; }
+        .history-empty-hint { font-family: var(--font-body); font-size: 13px; color: var(--fg3); }
+        .results-empty {
+            text-align: center; padding: 60px 24px;
+            background: var(--surface); border-radius: var(--radius-xl);
+            border: 2px dashed var(--border);
+        }
+        .results-empty-title { font-family: var(--font-display); font-size: 20px; font-weight: 700; color: var(--fg2); margin-bottom: 8px; }
+        .results-empty-hint { font-family: var(--font-body); font-size: 13px; color: var(--fg3); margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="app-header">
+    <a class="logo-wrap" href="/">
+        <div class="logo-mark">MW</div>
+        <div class="logo-text">
+            <div class="logo-title">AI TAKEOFF</div>
+            <div class="logo-sub">Concrete Quantity</div>
+        </div>
+    </a>
+    <div class="header-avatar">JD</div>
+</header>
+<!-- Sub-nav -->
+<nav class="app-subnav">
+    <button class="subnav-btn active" id="navUpload"   onclick="switchTab('upload')">Upload</button>
+    <button class="subnav-btn"        id="navResults"  onclick="switchTab('results')">Results</button>
+    <button class="subnav-btn"        id="navHistory"  onclick="switchTab('history')">History</button>
+</nav>
+
+<div class="page-wrap">
+
+    <!-- Page intro -->
+    <div class="page-intro">
+        <h1>Concrete Quantity Extraction</h1>
+        <p>Upload a construction drawing and get an instant, auditable concrete takeoff.</p>
+    </div>
+
+    <!-- Upload section -->
+    <div id="uploadSection" class="upload-section" style="display:flex;align-items:center;gap:20px;padding:24px 28px;text-align:left;">
+        <div class="upload-icon-wrap" style="flex-shrink:0;margin:0;">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E8611A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="12" y1="18" x2="12" y2="12"/>
+                <line x1="9" y1="15" x2="15" y2="15"/>
+            </svg>
+        </div>
+        <div style="flex:1;min-width:0;">
+            <div class="upload-title" style="font-size:18px;margin-bottom:3px;">Upload Construction Drawing</div>
+            <div class="upload-hint" style="margin-bottom:0;" id="filenameDisplay">PDF only · Drag &amp; drop or click · 100 MB max</div>
+        </div>
+        <input type="file" id="fileInput" accept=".pdf" />
+        <div class="btn-row" style="flex-shrink:0;" onclick="event.stopPropagation()">
+            <button class="upload-button" onclick="document.getElementById('fileInput').click()">Choose PDF</button>
+            <button class="demo-button" onclick="loadSampleData()">Load Sample</button>
+        </div>
+    </div>
+
+    <!-- How it works -->
+    <div class="how-it-works" id="howSection">
+        <div class="how-card">
+            <div class="how-num">01</div>
+            <div class="how-title">Upload PDF</div>
+            <div class="how-desc">Drop your construction drawing set — plan views, sections, and schedules.</div>
+        </div>
+        <div class="how-card">
+            <div class="how-num">02</div>
+            <div class="how-title">AI Extracts</div>
+            <div class="how-desc">Claude reads element dimensions, counts, and schedules to calculate volumes.</div>
+        </div>
+        <div class="how-card">
+            <div class="how-num">03</div>
+            <div class="how-title">Review &amp; Export</div>
+            <div class="how-desc">Edit any values, flag corrections, and export a clean takeoff sheet.</div>
+        </div>
+    </div>
+
+    <!-- Loading -->
+    <div id="loadingSection" class="loading">
+        <div class="spinner"></div>
+        <div class="loading-title">Analyzing drawings and extracting quantities&hellip;</div>
+        <div class="loading-hint" id="loadingMeta">This usually takes 30–90 seconds.</div>
+    </div>
+
+    <!-- Results empty state (shown when Results tab clicked with no data) -->
+    <div id="resultsEmptyState" style="display:none;">
+        <div class="results-empty">
+            <div class="history-empty-icon">📋</div>
+            <div class="results-empty-title">No results yet</div>
+            <div class="results-empty-hint">Upload a construction drawing or load sample data to see extracted quantities here.</div>
+            <button class="btn btn-primary" onclick="switchTab('upload')" style="margin-top:16px;">Go to Upload</button>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div id="resultsSection" class="results-section">
+
+        <div class="results-topbar">
+            <div>
+                <div class="results-topbar-title">Extraction Results</div>
+                <div class="results-topbar-meta" id="extractionMeta"></div>
+            </div>
+            <div class="topbar-actions">
+                <button class="btn btn-secondary" onclick="resetForm()" style="padding:8px 18px;font-size:13px;">Analyze Another</button>
+                <button class="btn btn-primary" onclick="exportResults()" style="padding:8px 18px;font-size:13px;">Export Results</button>
+            </div>
+        </div>
+
+        <!-- Summary -->
+        <div class="summary-card">
+            <div class="summary-label">Total Concrete Required</div>
+            <div class="summary-value" id="totalCubicYards">0</div>
+            <div class="summary-unit">Cubic Yards</div>
+            <div class="summary-delta" id="summaryDelta"></div>
+        </div>
+
+        <!-- Rating -->
+        <div class="rating-section" id="ratingSection" style="display:flex;">
+            <div class="rating-label">How accurate was this extraction overall?</div>
+            <div class="stars" id="starWidget">
+                <span class="star" data-value="1">&#9733;</span>
+                <span class="star" data-value="2">&#9733;</span>
+                <span class="star" data-value="3">&#9733;</span>
+                <span class="star" data-value="4">&#9733;</span>
+                <span class="star" data-value="5">&#9733;</span>
+            </div>
+            <div class="rating-hint" id="ratingHint">Click a star to rate</div>
+        </div>
+
+        <!-- Feedback Notes -->
+        <div class="feedback-notes-section" id="feedbackNotesSection">
+            <div class="feedback-notes-header">
+                <div class="feedback-notes-title">Feedback Notes</div>
+            </div>
+            <div class="feedback-notes-hint">Describe any patterns, systematic errors, or context that would help the AI improve future extractions.</div>
+            <textarea id="feedbackNotesText" class="feedback-notes-textarea" placeholder="e.g. The AI consistently underestimated footing depths — drawings use a non-standard depth callout on sheet S2. Grade beams were missed entirely because they weren't labelled as concrete." oninput="updateCharCount()"></textarea>
+            <div class="feedback-notes-char" id="feedbackNotesChar">0 chars</div>
+        </div>
+
+        <div class="meta-line" id="metaLine"></div>
+
+        <!-- Uncertainty legend -->
+        <p class="table-legend" id="uncertainLegend" style="display:none;">
+            <span class="legend-swatch legend-uncertain"></span>
+            Yellow rows contain assumption keywords and should be verified against drawings
+        </p>
+
+        <!-- Table -->
+        <div class="table-wrap">
+            <div class="table-wrap-header">Concrete Elements</div>
+            <div style="overflow-x:auto;">
+                <table class="elements-table" id="elementsTable">
+                    <thead>
+                        <tr>
+                            <th>Component</th>
+                            <th>Width (ft)</th>
+                            <th>Length (ft)</th>
+                            <th>Depth (ft)</th>
+                            <th>Qty</th>
+                            <th>Cu Ft</th>
+                            <th>CY</th>
+                            <th>Notes</th>
+                            <th>AI?</th>
+                        </tr>
+                    </thead>
+                    <tbody id="elementsBody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Diff panel -->
+        <div id="diffPanel" class="diff-panel">
+            <div class="diff-title">Your Corrections vs. AI Extraction</div>
+            <div class="diff-columns">
+                <div class="diff-col diff-ai">
+                    <h4>AI Extracted</h4>
+                    <div id="diffAiRows"></div>
+                    <div class="diff-total" id="diffAiTotal"></div>
+                </div>
+                <div class="diff-col diff-user">
+                    <h4>Your Corrections</h4>
+                    <div id="diffUserRows"></div>
+                    <div class="diff-total" id="diffUserTotal"></div>
+                </div>
+            </div>
+            <div class="diff-delta" id="diffDelta"></div>
+        </div>
+
+        <!-- Assumptions -->
+        <div id="assumptionsSection" class="assumptions"></div>
+
+        <!-- Actions -->
+        <div class="action-buttons">
+            <button class="btn btn-primary" onclick="exportResults()">Export Results</button>
+            <button class="btn btn-feedback" onclick="exportFeedback()">Export with Feedback</button>
+            <button class="btn btn-secondary" onclick="resetForm()">Analyze Another</button>
+        </div>
+    </div>
+
+    <!-- History -->
+    <div id="historySection" style="display:none;">
+        <div class="results-topbar" style="margin-bottom:20px;">
+            <div>
+                <div class="results-topbar-title">Analysis History</div>
+                <div class="results-topbar-meta">Recent takeoff analyses saved in this browser</div>
+            </div>
+            <button class="btn btn-secondary" onclick="clearHistory()" style="padding:8px 18px;font-size:13px;">Clear All</button>
+        </div>
+        <div id="historyList"></div>
+    </div>
+
+    <div id="messageArea"></div>
+</div>
+
+<script>
+    const RENDER_BACKEND = 'https://ai-takeoff-api.onrender.com';
+    const API_BASE = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://localhost:5001' : RENDER_BACKEND;
+    const fileInput = document.getElementById('fileInput');
+    const uploadSection = document.getElementById('uploadSection');
+    const loadingSection = document.getElementById('loadingSection');
+    const resultsSection = document.getElementById('resultsSection');
+    const historySection = document.getElementById('historySection');
+    const messageArea = document.getElementById('messageArea');
+    let currentFilename = '';
+    let sessionState = null;
+    const HISTORY_KEY = 'takeoff_history';
+
+    function switchTab(tab) {
+        ['upload','results','history'].forEach(t => {
+            document.getElementById('nav' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
+        });
+        uploadSection.style.display = 'none';
+        document.getElementById('howSection').style.display = 'none';
+        loadingSection.style.display = 'none';
+        resultsSection.style.display = 'none';
+        historySection.style.display = 'none';
+        document.getElementById('resultsEmptyState').style.display = 'none';
+        if (tab === 'upload') {
+            uploadSection.style.display = 'flex';
+            document.getElementById('howSection').style.display = 'grid';
+        } else if (tab === 'results') {
+            if (sessionState) {
+                resultsSection.style.display = 'block';
+            } else {
+                document.getElementById('resultsEmptyState').style.display = 'block';
+            }
+        } else if (tab === 'history') {
+            historySection.style.display = 'block';
+            renderHistoryTab();
+        }
+    }
+
+    const UNCERTAINTY_KEYWORDS = ['assumed','assumption','estimated','estimate','unclear','unknown','approximate','approx','not specified','not stated','typical','default','may vary','could be','possibly'];
+    function isUncertain(notes) { if (!notes) return false; const l=notes.toLowerCase(); return UNCERTAINTY_KEYWORDS.some(kw=>l.includes(kw)); }
+
+    // Drag & drop
+    uploadSection.addEventListener('dragover', (e) => { e.preventDefault(); uploadSection.classList.add('drag-over'); });
+    uploadSection.addEventListener('dragleave', () => uploadSection.classList.remove('drag-over'));
+    uploadSection.addEventListener('drop', (e) => {
+        e.preventDefault(); uploadSection.classList.remove('drag-over');
+        if (e.dataTransfer.files.length > 0) { fileInput.files = e.dataTransfer.files; handleFileUpload(); }
+    });
+    fileInput.addEventListener('change', handleFileUpload);
+
+    async function handleFileUpload() {
+        const file = fileInput.files[0]; if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.pdf')) { showMessage('Only PDF files are supported', 'error'); return; }
+        currentFilename = file.name;
+        document.getElementById('filenameDisplay').textContent = `Selected: ${file.name}`;
+        document.getElementById('howSection').style.display = 'none';
+        loadingSection.style.display = 'block'; resultsSection.style.display = 'none'; messageArea.innerHTML = '';
+        const formData = new FormData(); formData.append('file', file);
+        let response;
+        try { response = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData }); }
+        catch(err) { loadingSection.style.display='none'; showMessage(`Could not reach the backend. Is the Flask server running? (${err.message})`,'error'); return; }
+        let payload;
+        try { payload = await response.json(); }
+        catch(e) { loadingSection.style.display='none'; showMessage(`Server returned a non-JSON response (HTTP ${response.status}).`,'error'); return; }
+        loadingSection.style.display = 'none';
+        if (!response.ok || payload.error) { showMessage(payload.error || `HTTP ${response.status}`, 'error'); return; }
+        displayResults(payload.data, payload.filename, payload.pages_text_chars);
+        showMessage(`Successfully analyzed: ${payload.filename}`, 'success');
+    }
+
+    function loadSampleData() {
+        currentFilename = 'sample_drawing.pdf';
+        document.getElementById('filenameDisplay').textContent = `Selected: sample_drawing.pdf`;
+        document.getElementById('howSection').style.display = 'none';
+        loadingSection.style.display = 'block'; resultsSection.style.display = 'none'; messageArea.innerHTML = '';
+        setTimeout(() => {
+            displayResults(generateMockData(), 'sample_drawing.pdf', 0);
+            loadingSection.style.display = 'none';
+            showMessage('Sample data loaded (demo — not from a real PDF)', 'success');
+        }, 900);
+    }
+
+    function generateMockData() {
+        return {
+            summary: { total_cubic_yards: 127.45, total_cubic_feet: 3441.15, assumptions: ['Mock data only — not extracted from a real drawing','Concrete strength assumed 4,000 PSI','Waste factor of 5% included'] },
+            elements: [
+                {name:'Foundation Slab', width_ft:40,length_ft:60,depth_ft:1.0, qty:1,cubic_feet:2400, cubic_yards:88.89,notes:''},
+                {name:'Perimeter Footing',width_ft:2, length_ft:200,depth_ft:1.5,qty:1,cubic_feet:600,  cubic_yards:22.22,notes:''},
+                {name:'Column Footings', width_ft:4, length_ft:4,  depth_ft:1.5,qty:6,cubic_feet:144,   cubic_yards:5.33, notes:'Assumed 1.5 ft depth — not stated on drawing'},
+                {name:'Equipment Pad',  width_ft:10,length_ft:12, depth_ft:0.67,qty:1,cubic_feet:80,    cubic_yards:2.96, notes:'Estimated from typical equipment pad specs'},
+                {name:'Sidewalk',       width_ft:5, length_ft:80, depth_ft:0.33,qty:1,cubic_feet:132,   cubic_yards:4.89, notes:''},
+            ],
+        };
+    }
+
+    function displayResults(data, filename, charCount) {
+        const elements=(data&&data.elements)||[], summary=(data&&data.summary)||{};
+        sessionState = {
+            filename, analysisDate:new Date().toISOString(), overallRating:null,
+            elements: elements.map((elem,i)=>{
+                const ai={name:elem.name||'',width_ft:parseFloat(elem.width_ft)||0,length_ft:parseFloat(elem.length_ft)||0,depth_ft:parseFloat(elem.depth_ft)||0,qty:parseFloat(elem.qty)||1,cubic_feet:parseFloat(elem.cubic_feet)||0,cubic_yards:parseFloat(elem.cubic_yards)||0,notes:elem.notes||''};
+                return {id:i,uncertain:isUncertain(ai.notes),ai,user:{...ai},edited:false,flag:null};
+            }),
+            summary:{ai_total_cubic_yards:parseFloat(summary.total_cubic_yards)||0,ai_total_cubic_feet:parseFloat(summary.total_cubic_feet)||0,user_total_cubic_yards:parseFloat(summary.total_cubic_yards)||0,assumptions:summary.assumptions||[],analysis:summary.analysis||null},
+        };
+        document.getElementById('totalCubicYards').textContent = sessionState.summary.ai_total_cubic_yards.toFixed(2);
+        document.getElementById('summaryDelta').classList.remove('visible');
+        document.getElementById('ratingSection').style.display = 'flex';
+        document.getElementById('ratingHint').textContent = 'Click a star to rate';
+        document.querySelectorAll('.star').forEach(s=>s.classList.remove('active'));
+        const meta = document.getElementById('extractionMeta');
+        meta.textContent = charCount ? `${filename} · ${charCount.toLocaleString()} chars analyzed` : `Source: ${filename}`;
+        document.getElementById('metaLine').textContent = charCount ? `Extracted from ${filename} — ${charCount.toLocaleString()} chars of PDF text analyzed` : '';
+        const hasUncertain = sessionState.elements.some(e=>e.uncertain);
+        document.getElementById('uncertainLegend').style.display = hasUncertain ? 'flex' : 'none';
+        const tbody = document.getElementById('elementsBody'); tbody.innerHTML='';
+        if (!sessionState.elements.length) {
+            const row=document.createElement('tr'); row.innerHTML=`<td colspan="9" style="text-align:center;color:#9C8778;padding:24px;font-family:'Nunito'">No concrete elements extracted. See assumptions below.</td>`; tbody.appendChild(row);
+        } else { sessionState.elements.forEach(el=>renderRow(el,tbody)); }
+        const ass=document.getElementById('assumptionsSection'); const assList=sessionState.summary.assumptions;
+        let html='<h3>Assumptions &amp; Notes</h3>'; html+='<ul>';
+        if (assList.length) assList.forEach(a=>{html+=`<li>${escapeHtml(a)}</li>`;});
+        else html+='<li>This extraction is automated and should be verified against original drawings.</li>';
+        html+='</ul>';
+        if (sessionState.summary.analysis) html+=`<details style="margin-top:10px;"><summary>Raw analysis</summary><pre style="white-space:pre-wrap;font-size:12px;margin-top:8px;font-family:'JetBrains Mono'">${escapeHtml(sessionState.summary.analysis)}</pre></details>`;
+        ass.innerHTML=html;
+        document.getElementById('diffPanel').style.display='none';
+        document.getElementById('resultsEmptyState').style.display='none';
+        historySection.style.display='none';
+        uploadSection.style.display='none';
+        document.getElementById('howSection').style.display='none';
+        resultsSection.style.display='block';
+        document.getElementById('navResults').classList.add('active');
+        document.getElementById('navUpload').classList.remove('active');
+        document.getElementById('navHistory').classList.remove('active');
+        saveToHistory(sessionState);
+    }
+
+    function renderRow(el,tbody) {
+        const row=document.createElement('tr'); row.id=`row-${el.id}`;
+        if(el.uncertain) row.classList.add('row-uncertain');
+        const nameSpan=`<span contenteditable="true" data-id="${el.id}" data-field="name" oninput="onFieldChange(${el.id},'name',this.textContent)" style="font-weight:600;">${escapeHtml(el.user.name)}</span>${el.uncertain?'<span class="uncertain-icon" title="Contains assumption keywords">⚠</span>':''}`;
+        const wI=numInput(el.id,'width_ft',el.user.width_ft), lI=numInput(el.id,'length_ft',el.user.length_ft), dI=numInput(el.id,'depth_ft',el.user.depth_ft), qI=numInput(el.id,'qty',el.user.qty,0.5);
+        const notesSpan=`<span contenteditable="true" data-id="${el.id}" data-field="notes" oninput="onFieldChange(${el.id},'notes',this.textContent)" style="font-size:12px;color:#9C8778;">${escapeHtml(el.user.notes||'')}</span>`;
+        row.innerHTML=`<td>${nameSpan}</td><td>${wI}</td><td>${lI}</td><td>${dI}</td><td>${qI}</td><td class="computed-cell" id="cf-${el.id}">${el.user.cubic_feet.toFixed(1)}</td><td class="cy-cell" id="cy-${el.id}">${el.user.cubic_yards.toFixed(2)}</td><td>${notesSpan}</td><td class="flag-cell"><button class="flag-btn correct" onclick="onFlag(${el.id},'correct')" title="Correct">✓</button><button class="flag-btn incorrect" onclick="onFlag(${el.id},'incorrect')" title="Incorrect">✗</button></td>`;
+        tbody.appendChild(row);
+        // Correction note row (shown when flagged incorrect)
+        const noteRow=document.createElement('tr'); noteRow.id=`note-row-${el.id}`; noteRow.className='correction-note-row';
+        noteRow.innerHTML=`<td colspan="9"><textarea class="correction-note-input" id="correction-note-${el.id}" placeholder="What was wrong with this element? (e.g. wrong depth assumed, element missed, duplicate counted…)" rows="2" oninput="onCorrectionNote(${el.id},this.value)"></textarea></td>`;
+        tbody.appendChild(noteRow);
+    }
+    function numInput(id,field,value,step){const s=step||'any';return `<input type="number" step="${s}" min="0" value="${value}" data-id="${id}" data-field="${field}" oninput="onFieldChange(${id},'${field}',parseFloat(this.value)||0)">`;}
+
+    function onFieldChange(rowId,field,value){
+        if(!sessionState) return;
+        const el=sessionState.elements[rowId]; el.user[field]=value; el.edited=JSON.stringify(el.user)!==JSON.stringify(el.ai);
+        const row=document.getElementById(`row-${rowId}`);
+        el.edited?row.classList.add('row-edited'):row.classList.remove('row-edited');
+        recalculateRow(rowId); updateSummaryCard(); renderDiffPanel();
+    }
+    function recalculateRow(id){
+        const el=sessionState.elements[id],u=el.user;
+        const cf=u.width_ft*u.length_ft*u.depth_ft*u.qty, cy=cf/27;
+        u.cubic_feet=parseFloat(cf.toFixed(4)); u.cubic_yards=parseFloat(cy.toFixed(4));
+        const cfC=document.getElementById(`cf-${id}`),cyC=document.getElementById(`cy-${id}`);
+        if(cfC) cfC.textContent=cf.toFixed(1);
+        if(cyC){cyC.textContent=cy.toFixed(2); cyC.className=el.edited?'cy-cell edited':'cy-cell';}
+    }
+    function updateSummaryCard(){
+        if(!sessionState) return;
+        const total=sessionState.elements.reduce((s,e)=>s+e.user.cubic_yards,0);
+        sessionState.summary.user_total_cubic_yards=parseFloat(total.toFixed(4));
+        document.getElementById('totalCubicYards').textContent=total.toFixed(2);
+        const ai=sessionState.summary.ai_total_cubic_yards,delta=total-ai,pct=ai?(delta/ai*100):0;
+        const d=document.getElementById('summaryDelta');
+        if(sessionState.elements.some(e=>e.edited)){const s=delta>=0?'+':'';d.textContent=`${s}${delta.toFixed(2)} CY from AI (${s}${pct.toFixed(1)}%) after corrections`;d.classList.add('visible');}
+        else d.classList.remove('visible');
+    }
+    function onFlag(rowId,value){
+        if(!sessionState) return;
+        const el=sessionState.elements[rowId]; el.flag=el.flag===value?null:value;
+        const row=document.getElementById(`row-${rowId}`);
+        row.querySelectorAll('.flag-btn').forEach(btn=>{btn.classList.remove('active');if(el.flag&&btn.classList.contains(el.flag))btn.classList.add('active');});
+        // Show/hide correction note row
+        const noteRow=document.getElementById(`note-row-${rowId}`);
+        if(noteRow) noteRow.style.display = el.flag==='incorrect' ? 'table-row' : 'none';
+        if(el.flag!=='incorrect'){ el.correctionNote=''; const inp=document.getElementById(`correction-note-${rowId}`); if(inp) inp.value=''; }
+    }
+    function onCorrectionNote(rowId,value){
+        if(!sessionState) return;
+        sessionState.elements[rowId].correctionNote = value;
+    }
+    function updateCharCount(){
+        const ta=document.getElementById('feedbackNotesText');
+        document.getElementById('feedbackNotesChar').textContent=`${ta.value.length} chars`;
+    }
+
+    // Star rating
+    const RATING_LABELS=['','Poor','Fair','Good','Very Good','Excellent'];
+    document.getElementById('starWidget').addEventListener('mousemove',(e)=>{
+        const star=e.target.closest('.star'); if(!star) return;
+        const val=parseInt(star.dataset.value,10);
+        document.querySelectorAll('.star').forEach(s=>{s.classList.toggle('hover',parseInt(s.dataset.value,10)<=val);});
+    });
+    document.getElementById('starWidget').addEventListener('mouseleave',()=>document.querySelectorAll('.star').forEach(s=>s.classList.remove('hover')));
+    document.getElementById('starWidget').addEventListener('click',(e)=>{
+        const star=e.target.closest('.star'); if(!star||!sessionState) return;
+        const val=parseInt(star.dataset.value,10); sessionState.overallRating=val;
+        document.querySelectorAll('.star').forEach(s=>s.classList.toggle('active',parseInt(s.dataset.value,10)<=val));
+        document.getElementById('ratingHint').textContent=`Rated ${val}/5 — ${RATING_LABELS[val]}`;
+    });
+
+    function renderDiffPanel(){
+        if(!sessionState) return;
+        const anyEdited=sessionState.elements.some(e=>e.edited);
+        const panel=document.getElementById('diffPanel'); panel.style.display=anyEdited?'block':'none';
+        if(!anyEdited) return;
+        const aiR=document.getElementById('diffAiRows'),uR=document.getElementById('diffUserRows'); aiR.innerHTML=''; uR.innerHTML='';
+        sessionState.elements.forEach(el=>{
+            const cls=el.edited?'diff-row changed':'diff-row unchanged';
+            const aiD=document.createElement('div');aiD.className=cls;aiD.innerHTML=`<span class="diff-row-name">${escapeHtml(el.ai.name)}</span><span class="diff-row-val">${el.ai.cubic_yards.toFixed(2)} CY</span>`;aiR.appendChild(aiD);
+            const uD=document.createElement('div');uD.className=cls;uD.innerHTML=`<span class="diff-row-name">${escapeHtml(el.user.name)}</span><span class="diff-row-val">${el.user.cubic_yards.toFixed(2)} CY</span>`;uR.appendChild(uD);
+        });
+        const at=sessionState.summary.ai_total_cubic_yards,ut=sessionState.summary.user_total_cubic_yards;
+        document.getElementById('diffAiTotal').textContent=`Total: ${at.toFixed(2)} CY`;
+        document.getElementById('diffUserTotal').textContent=`Total: ${ut.toFixed(2)} CY`;
+        const delta=ut-at,pct=at?(delta/at*100):0,sign=delta>=0?'+':'';
+        const d=document.getElementById('diffDelta');
+        d.textContent=`Net change: ${sign}${delta.toFixed(2)} CY (${sign}${pct.toFixed(1)}%)`;
+        d.className='diff-delta '+(Math.abs(delta)<0.001?'zero':delta>0?'positive':'negative');
+    }
+
+    function exportResults(){
+        if(!sessionState) return;
+        const d={source_file:sessionState.filename,total_cubic_yards:sessionState.summary.user_total_cubic_yards,elements:sessionState.elements.map(e=>({name:e.user.name,width_ft:e.user.width_ft,length_ft:e.user.length_ft,depth_ft:e.user.depth_ft,qty:e.user.qty,cubic_feet:e.user.cubic_feet,cubic_yards:e.user.cubic_yards,notes:e.user.notes})),export_date:new Date().toISOString(),disclaimer:'Automated extraction — verify against original drawings.'};
+        downloadJson(d,`takeoff_${dateStamp()}.json`); showMessage('Results exported','success');
+    }
+    function exportFeedback(){
+        if(!sessionState) return;
+        const edited=sessionState.elements.filter(e=>e.edited).length,correct=sessionState.elements.filter(e=>e.flag==='correct').length,incorrect=sessionState.elements.filter(e=>e.flag==='incorrect').length;
+        const humanNotes=(document.getElementById('feedbackNotesText')||{}).value||'';
+        const d={export_version:'2.0',export_date:new Date().toISOString(),source_file:sessionState.filename,analysis_date:sessionState.analysisDate,session:{overall_rating:sessionState.overallRating,overall_rating_max:5,human_notes:humanNotes||null},summary:{ai_total_cubic_yards:sessionState.summary.ai_total_cubic_yards,user_total_cubic_yards:sessionState.summary.user_total_cubic_yards,delta_cubic_yards:parseFloat((sessionState.summary.user_total_cubic_yards-sessionState.summary.ai_total_cubic_yards).toFixed(4)),elements_total:sessionState.elements.length,elements_edited:edited,elements_flagged_correct:correct,elements_flagged_incorrect:incorrect},elements:sessionState.elements.map(el=>({id:el.id,uncertain:el.uncertain,edited:el.edited,flag:el.flag,correction_note:el.correctionNote||null,ai_extracted:{...el.ai},user_corrected:{...el.user}})),assumptions:sessionState.summary.assumptions,disclaimer:'Automated extraction — verify against original drawings.'};
+        downloadJson(d,`takeoff_feedback_${dateStamp()}.json`);
+        fetch(`${API_BASE}/api/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+            .then(r=>r.json())
+            .then(data=>{
+                if(data.learning_triggered){
+                    showMessage('Feedback saved — AI is learning from your corrections...','success');
+                } else {
+                    showMessage('Feedback exported (includes corrections data)','success');
+                }
+            })
+            .catch(()=>{ showMessage('Feedback exported (includes corrections data)','success'); });
+    }
+    function buildCorrectionsDiff(ai,user){const diff={};['width_ft','length_ft','depth_ft','qty','cubic_feet','cubic_yards'].forEach(f=>{if(Math.abs((ai[f]||0)-(user[f]||0))>0.0001)diff[f]={ai:ai[f],user:user[f]};});['name','notes'].forEach(f=>{if((ai[f]||'')!==(user[f]||''))diff[f]={ai:ai[f],user:user[f]};});return diff;}
+    function downloadJson(data,filename){const b=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=filename;a.click();URL.revokeObjectURL(u);}
+    function dateStamp(){return new Date().toISOString().split('T')[0];}
+    function resetForm(){fileInput.value='';sessionState=null;loadingSection.style.display='none';messageArea.innerHTML='';document.getElementById('filenameDisplay').textContent='PDF only · Drag & drop or click · 100 MB max';switchTab('upload');}
+    function showMessage(message,type){const div=document.createElement('div');div.className=`msg ${type}`;div.textContent=message;messageArea.innerHTML='';messageArea.appendChild(div);}
+    function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+    // ── History ───────────────────────────────────────────
+    function loadHistoryArr() {
+        try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch(e) { return []; }
+    }
+
+    function saveToHistory(state) {
+        const arr = loadHistoryArr();
+        arr.unshift({
+            id: Date.now(),
+            filename: state.filename,
+            date: state.analysisDate,
+            totalCY: state.summary.ai_total_cubic_yards,
+            elementCount: state.elements.length,
+            snapshot: {
+                elements: state.elements.map(e => ({...e.ai})),
+                summary: {
+                    total_cubic_yards: state.summary.ai_total_cubic_yards,
+                    total_cubic_feet: state.summary.ai_total_cubic_feet || 0,
+                    assumptions: state.summary.assumptions || [],
+                    analysis: state.summary.analysis || null,
+                },
+            }
+        });
+        try { localStorage.setItem(HISTORY_KEY, JSON.stringify(arr.slice(0, 20))); } catch(e) {}
+    }
+
+    function clearHistory() {
+        if (!confirm('Clear all analysis history from this browser?')) return;
+        localStorage.removeItem(HISTORY_KEY);
+        renderHistoryTab();
+    }
+
+    function renderHistoryTab() {
+        const list = document.getElementById('historyList');
+        const arr = loadHistoryArr();
+        if (!arr.length) {
+            list.innerHTML = `<div class="history-empty">
+                <div class="history-empty-icon">🗂️</div>
+                <div class="history-empty-title">No analyses yet</div>
+                <div class="history-empty-hint">Upload a construction drawing to get started. Each analysis will appear here.</div>
+            </div>`;
+            return;
+        }
+        list.innerHTML = arr.map((entry, i) => `
+            <div class="history-card" onclick="loadHistoryEntry(${i})">
+                <div class="history-card-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E8611A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="12" y1="18" x2="12" y2="12"/>
+                        <line x1="9" y1="15" x2="15" y2="15"/>
+                    </svg>
+                </div>
+                <div class="history-card-body">
+                    <div class="history-card-name">${escapeHtml(entry.filename)}</div>
+                    <div class="history-card-meta">${new Date(entry.date).toLocaleString()} &middot; ${entry.elementCount} element${entry.elementCount !== 1 ? 's' : ''}</div>
+                </div>
+                <div class="history-card-stat">
+                    <div class="history-card-stat-val">${entry.totalCY.toFixed(2)}</div>
+                    <div class="history-card-stat-label">Cubic Yards</div>
+                </div>
+                <button class="btn btn-secondary" style="padding:8px 16px;font-size:13px;flex-shrink:0;" onclick="event.stopPropagation();loadHistoryEntry(${i})">Load</button>
+            </div>
+        `).join('');
+    }
+
+    function loadHistoryEntry(index) {
+        const arr = loadHistoryArr();
+        const entry = arr[index]; if (!entry) return;
+        displayResults({ elements: entry.snapshot.elements, summary: entry.snapshot.summary }, entry.filename, 0);
+        showMessage(`Loaded: ${entry.filename} (from history)`, 'success');
+    }
+</script>
+</body>
+</html>
