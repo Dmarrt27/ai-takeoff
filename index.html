@@ -323,6 +323,39 @@
         .diff-delta.negative { color: var(--error); }
         .diff-delta.zero     { color: var(--fg3); }
 
+        /* Raw analysis fallback panel */
+        .raw-analysis-panel {
+            background: var(--surface);
+            border: 1.5px solid var(--border-strong);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow-sm);
+        }
+        .raw-analysis-header {
+            display: flex; align-items: flex-start; gap: 10px;
+            padding: 14px 18px;
+            background: var(--amber-bg);
+            border-bottom: 1px solid var(--amber);
+            color: #7A5800;
+            font-family: var(--font-body); font-size: 13px; font-weight: 600;
+            line-height: 1.5;
+        }
+        .raw-analysis-header svg { flex-shrink: 0; margin-top: 1px; color: var(--amber); }
+        .raw-analysis-pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.7;
+            color: var(--fg1);
+            padding: 18px 20px;
+            margin: 0;
+            max-height: 420px;
+            overflow-y: auto;
+            background: var(--surface);
+        }
+
         /* Assumptions */
         .assumptions {
             background: var(--primary-wash); border-left: 3px solid var(--primary);
@@ -396,6 +429,61 @@
         }
         .correction-note-input::placeholder { color: #C0392B; opacity: 0.55; }
         .correction-note-input:focus { border-color: var(--primary-dark); }
+
+        /* ── Snippet attachments ────────────────────────── */
+        .snippet-area { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+        .snippet-area-label {
+            font-family: var(--font-body); font-size: 11px; font-weight: 700;
+            color: var(--fg2); margin-bottom: 8px; letter-spacing: 0.05em; text-transform: uppercase;
+        }
+        .snippet-count-badge {
+            display: inline-block; background: var(--primary-wash); color: var(--primary);
+            border-radius: 10px; font-size: 10px; font-weight: 700; padding: 1px 7px;
+            margin-left: 5px; vertical-align: middle; font-family: var(--font-mono);
+        }
+        .snippet-drop-zone {
+            border: 1.5px dashed var(--border-strong); border-radius: var(--radius-md);
+            padding: 12px 16px; cursor: pointer; transition: all 0.2s; background: var(--bg);
+        }
+        .snippet-drop-zone:hover, .snippet-drop-zone.drag-active {
+            border-color: var(--primary); background: var(--primary-wash);
+        }
+        .snippet-drop-zone.drag-active { transform: scale(1.01); }
+        .snippet-drop-inner {
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            font-family: var(--font-body); font-size: 12px; color: var(--fg3); text-align: center;
+        }
+        .snippet-drop-inner svg { flex-shrink: 0; }
+        .snippet-drop-inner b { color: var(--primary); font-weight: 700; }
+        .snippet-previews { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .snippet-preview-item {
+            display: flex; align-items: flex-start; gap: 12px;
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: var(--radius-md); padding: 10px 12px;
+        }
+        .snippet-thumb {
+            width: 72px; height: 54px; object-fit: cover;
+            border-radius: 5px; border: 1px solid var(--border-strong);
+            flex-shrink: 0; cursor: zoom-in;
+        }
+        .snippet-preview-body { flex: 1; min-width: 0; }
+        .snippet-filename {
+            font-family: var(--font-mono); font-size: 11px; color: var(--fg2);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 5px;
+        }
+        .snippet-caption-input {
+            width: 100%; border: 1px solid var(--border); border-radius: 4px;
+            padding: 5px 8px; font-family: var(--font-body); font-size: 12px;
+            color: var(--fg1); background: var(--surface); outline: none; transition: border-color 0.2s;
+        }
+        .snippet-caption-input::placeholder { color: var(--fg3); }
+        .snippet-caption-input:focus { border-color: var(--primary); }
+        .snippet-remove-btn {
+            background: none; border: 1px solid var(--border); border-radius: 4px;
+            cursor: pointer; color: var(--fg3); font-size: 16px; line-height: 1;
+            padding: 2px 7px; flex-shrink: 0; transition: all 0.15s;
+        }
+        .snippet-remove-btn:hover { background: var(--error-bg); color: var(--error); border-color: var(--error); }
 
         /* ── History ─────────────────────────────────────── */
         .history-card {
@@ -561,6 +649,18 @@
             <div class="feedback-notes-hint">Describe any patterns, systematic errors, or context that would help the AI improve future extractions.</div>
             <textarea id="feedbackNotesText" class="feedback-notes-textarea" placeholder="e.g. The AI consistently underestimated footing depths — drawings use a non-standard depth callout on sheet S2. Grade beams were missed entirely because they weren't labelled as concrete." oninput="updateCharCount()"></textarea>
             <div class="feedback-notes-char" id="feedbackNotesChar">0 chars</div>
+            <!-- Drawing snippet attachments -->
+            <div class="snippet-area">
+                <div class="snippet-area-label">Drawing Snippets <span class="snippet-count-badge" id="snippetCountBadge" style="display:none"></span></div>
+                <div class="snippet-drop-zone" id="snippetDropZone">
+                    <div class="snippet-drop-inner">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        <span>Paste (Ctrl+V), drag &amp; drop, or <b>browse</b> &mdash; attaches drawing screenshots so the AI learns from visual context</span>
+                    </div>
+                </div>
+                <input type="file" id="snippetFileInput" accept="image/*" multiple style="display:none">
+                <div id="snippetPreviews" class="snippet-previews"></div>
+            </div>
         </div>
 
         <div class="meta-line" id="metaLine"></div>
@@ -615,6 +715,15 @@
         <!-- Assumptions -->
         <div id="assumptionsSection" class="assumptions"></div>
 
+        <!-- Raw analysis fallback panel (shown only when parse fully fails) -->
+        <div id="rawAnalysisPanel" class="raw-analysis-panel" style="display:none;">
+            <div class="raw-analysis-header">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <span>AI returned narrative analysis — dimensions could not be auto-parsed into table rows. Review the text below and enter values manually.</span>
+            </div>
+            <pre id="rawAnalysisContent" class="raw-analysis-pre"></pre>
+        </div>
+
         <!-- Actions -->
         <div class="action-buttons">
             <button class="btn btn-primary" onclick="exportResults()">Export Results</button>
@@ -649,6 +758,7 @@
     const messageArea = document.getElementById('messageArea');
     let currentFilename = '';
     let sessionState = null;
+    let snippetImages = [];
     const HISTORY_KEY = 'takeoff_history';
 
     function switchTab(tab) {
@@ -757,13 +867,71 @@
         if (!sessionState.elements.length) {
             const row=document.createElement('tr'); row.innerHTML=`<td colspan="9" style="text-align:center;color:#9C8778;padding:24px;font-family:'Nunito'">No concrete elements extracted. See assumptions below.</td>`; tbody.appendChild(row);
         } else { sessionState.elements.forEach(el=>renderRow(el,tbody)); }
-        const ass=document.getElementById('assumptionsSection'); const assList=sessionState.summary.assumptions;
-        let html='<h3>Assumptions &amp; Notes</h3>'; html+='<ul>';
-        if (assList.length) assList.forEach(a=>{html+=`<li>${escapeHtml(a)}</li>`;});
-        else html+='<li>This extraction is automated and should be verified against original drawings.</li>';
-        html+='</ul>';
-        if (sessionState.summary.analysis) html+=`<details style="margin-top:10px;"><summary>Raw analysis</summary><pre style="white-space:pre-wrap;font-size:12px;margin-top:8px;font-family:'JetBrains Mono'">${escapeHtml(sessionState.summary.analysis)}</pre></details>`;
-        ass.innerHTML=html;
+        // ── If no structured elements, try parsing the first-turn prose ──
+        const rawPanel = document.getElementById('rawAnalysisPanel');
+        const rawContent = document.getElementById('rawAnalysisContent');
+        if (!sessionState.elements.length && sessionState.summary.analysis) {
+            const parsed = parseUnstructuredAnalysis(sessionState.summary.analysis);
+            if (parsed.elements.length) {
+                sessionState.elements = parsed.elements.map((elem, i) => {
+                    const ai = {
+                        name: elem.name || '',
+                        width_ft: parseFloat(elem.width_ft) || 0,
+                        length_ft: parseFloat(elem.length_ft) || 0,
+                        depth_ft: parseFloat(elem.depth_ft) || 0,
+                        qty: parseFloat(elem.qty) || 1,
+                        cubic_feet: parseFloat(elem.cubic_feet) || 0,
+                        cubic_yards: parseFloat(elem.cubic_yards) || 0,
+                        notes: elem.notes || ''
+                    };
+                    return { id: i, uncertain: isUncertain(ai.notes), ai, user: { ...ai }, edited: false, flag: null };
+                });
+                if (parsed.total_cubic_yards) {
+                    sessionState.summary.ai_total_cubic_yards = parsed.total_cubic_yards;
+                    sessionState.summary.user_total_cubic_yards = parsed.total_cubic_yards;
+                } else {
+                    const tot = sessionState.elements.reduce((s, e) => s + e.ai.cubic_yards, 0);
+                    sessionState.summary.ai_total_cubic_yards = parseFloat(tot.toFixed(4));
+                    sessionState.summary.user_total_cubic_yards = parseFloat(tot.toFixed(4));
+                }
+                document.getElementById('totalCubicYards').textContent = sessionState.summary.ai_total_cubic_yards.toFixed(2);
+                const hasUncertain2 = sessionState.elements.some(e => e.uncertain);
+                document.getElementById('uncertainLegend').style.display = hasUncertain2 ? 'flex' : 'none';
+                const tbody2 = document.getElementById('elementsBody'); tbody2.innerHTML = '';
+                sessionState.elements.forEach(el => renderRow(el, tbody2));
+            }
+        }
+
+        // ── Raw analysis panel (only when parse completely failed and has content) ──
+        if (sessionState.summary.analysis && !sessionState.elements.length) {
+            rawPanel.style.display = 'block';
+            rawContent.textContent = sessionState.summary.analysis;
+        } else {
+            rawPanel.style.display = 'none';
+        }
+
+        // ── Assumptions section — only show when there are real assumptions ──
+        const ass = document.getElementById('assumptionsSection');
+        const NOISE_PATTERNS = [
+            'claude returned unstructured text',
+            'see analysis below',
+            'could not extract structured quantities',
+        ];
+        const assList = (sessionState.summary.assumptions || []).filter(a => {
+            const l = a.toLowerCase();
+            return !NOISE_PATTERNS.some(p => l.includes(p));
+        });
+        if (assList.length) {
+            let html = '<h3>Assumptions &amp; Notes</h3><ul>';
+            assList.forEach(a => { html += `<li>${escapeHtml(a)}</li>`; });
+            html += '</ul>';
+            ass.innerHTML = html;
+            ass.style.display = 'block';
+        } else {
+            ass.innerHTML = '';
+            ass.style.display = 'none';
+        }
+
         document.getElementById('diffPanel').style.display='none';
         document.getElementById('resultsEmptyState').style.display='none';
         historySection.style.display='none';
@@ -835,6 +1003,96 @@
         document.getElementById('feedbackNotesChar').textContent=`${ta.value.length} chars`;
     }
 
+    // ── Snippet image attachments ──────────────────────────────────────────
+    const MAX_SNIPPETS = 4;
+    const SNIPPET_MAX_DIM = 1200;
+
+    function resizeAndEncodeSnippet(file) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const url = URL.createObjectURL(file);
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                let w = img.naturalWidth, h = img.naturalHeight;
+                if (w > SNIPPET_MAX_DIM || h > SNIPPET_MAX_DIM) {
+                    if (w >= h) { h = Math.round(h * SNIPPET_MAX_DIM / w); w = SNIPPET_MAX_DIM; }
+                    else        { w = Math.round(w * SNIPPET_MAX_DIM / h); h = SNIPPET_MAX_DIM; }
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                resolve(canvas.toDataURL('image/jpeg', 0.85));
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image load failed')); };
+            img.src = url;
+        });
+    }
+
+    async function addSnippet(file) {
+        if (!file || !file.type.startsWith('image/')) return;
+        if (snippetImages.length >= MAX_SNIPPETS) { showMessage(`Max ${MAX_SNIPPETS} snippets allowed`, 'error'); return; }
+        try {
+            const dataUrl = await resizeAndEncodeSnippet(file);
+            snippetImages.push({ data_url: dataUrl, filename: file.name || 'snippet.jpg', caption: '' });
+            renderSnippetPreviews();
+        } catch(e) { showMessage('Could not attach image snippet', 'error'); }
+    }
+
+    function removeSnippet(i) {
+        snippetImages.splice(i, 1);
+        renderSnippetPreviews();
+    }
+
+    function renderSnippetPreviews() {
+        const container = document.getElementById('snippetPreviews');
+        const badge = document.getElementById('snippetCountBadge');
+        if (!container) return;
+        if (!snippetImages.length) {
+            container.innerHTML = '';
+            if (badge) badge.style.display = 'none';
+            return;
+        }
+        if (badge) { badge.textContent = snippetImages.length; badge.style.display = 'inline-block'; }
+        container.innerHTML = snippetImages.map((img, i) => `
+            <div class="snippet-preview-item">
+                <img src="${img.data_url}" class="snippet-thumb" alt="${escapeHtml(img.filename)}" onclick="window.open(this.src,'_blank')">
+                <div class="snippet-preview-body">
+                    <div class="snippet-filename">${escapeHtml(img.filename)}</div>
+                    <input class="snippet-caption-input" type="text"
+                        placeholder="Caption: e.g. 'Sheet S2 — footing depth callout'"
+                        value="${escapeHtml(img.caption)}"
+                        oninput="snippetImages[${i}].caption = this.value">
+                </div>
+                <button class="snippet-remove-btn" onclick="removeSnippet(${i})" title="Remove">&times;</button>
+            </div>
+        `).join('');
+    }
+
+    // Paste anywhere while results are visible
+    document.addEventListener('paste', (e) => {
+        if (resultsSection.style.display === 'none') return;
+        Array.from(e.clipboardData?.items || []).forEach(item => {
+            if (item.type.startsWith('image/')) addSnippet(item.getAsFile());
+        });
+    });
+
+    // Wire up snippet drop zone and file input
+    (function initSnippetZone() {
+        const zone = document.getElementById('snippetDropZone');
+        if (!zone) return;
+        zone.addEventListener('click', () => document.getElementById('snippetFileInput').click());
+        zone.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag-active'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('drag-active'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag-active');
+            Array.from(e.dataTransfer.files).forEach(f => addSnippet(f));
+        });
+        document.getElementById('snippetFileInput').addEventListener('change', (e) => {
+            Array.from(e.target.files).forEach(f => addSnippet(f));
+            e.target.value = '';
+        });
+    })();
+
     // Star rating
     const RATING_LABELS=['','Poor','Fair','Good','Very Good','Excellent'];
     document.getElementById('starWidget').addEventListener('mousemove',(e)=>{
@@ -879,7 +1137,7 @@
         if(!sessionState) return;
         const edited=sessionState.elements.filter(e=>e.edited).length,correct=sessionState.elements.filter(e=>e.flag==='correct').length,incorrect=sessionState.elements.filter(e=>e.flag==='incorrect').length;
         const humanNotes=(document.getElementById('feedbackNotesText')||{}).value||'';
-        const d={export_version:'2.0',export_date:new Date().toISOString(),source_file:sessionState.filename,analysis_date:sessionState.analysisDate,session:{overall_rating:sessionState.overallRating,overall_rating_max:5,human_notes:humanNotes||null},summary:{ai_total_cubic_yards:sessionState.summary.ai_total_cubic_yards,user_total_cubic_yards:sessionState.summary.user_total_cubic_yards,delta_cubic_yards:parseFloat((sessionState.summary.user_total_cubic_yards-sessionState.summary.ai_total_cubic_yards).toFixed(4)),elements_total:sessionState.elements.length,elements_edited:edited,elements_flagged_correct:correct,elements_flagged_incorrect:incorrect},elements:sessionState.elements.map(el=>({id:el.id,uncertain:el.uncertain,edited:el.edited,flag:el.flag,correction_note:el.correctionNote||null,ai_extracted:{...el.ai},user_corrected:{...el.user}})),assumptions:sessionState.summary.assumptions,disclaimer:'Automated extraction — verify against original drawings.'};
+        const d={export_version:'2.0',export_date:new Date().toISOString(),source_file:sessionState.filename,analysis_date:sessionState.analysisDate,session:{overall_rating:sessionState.overallRating,overall_rating_max:5,human_notes:humanNotes||null},summary:{ai_total_cubic_yards:sessionState.summary.ai_total_cubic_yards,user_total_cubic_yards:sessionState.summary.user_total_cubic_yards,delta_cubic_yards:parseFloat((sessionState.summary.user_total_cubic_yards-sessionState.summary.ai_total_cubic_yards).toFixed(4)),elements_total:sessionState.elements.length,elements_edited:edited,elements_flagged_correct:correct,elements_flagged_incorrect:incorrect},elements:sessionState.elements.map(el=>({id:el.id,uncertain:el.uncertain,edited:el.edited,flag:el.flag,correction_note:el.correctionNote||null,ai_extracted:{...el.ai},user_corrected:{...el.user}})),assumptions:sessionState.summary.assumptions,disclaimer:'Automated extraction — verify against original drawings.',snippet_images:snippetImages.map(img=>({data_url:img.data_url,filename:img.filename,caption:img.caption}))};
         downloadJson(d,`takeoff_feedback_${dateStamp()}.json`);
         fetch(`${API_BASE}/api/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
             .then(r=>r.json())
@@ -895,9 +1153,189 @@
     function buildCorrectionsDiff(ai,user){const diff={};['width_ft','length_ft','depth_ft','qty','cubic_feet','cubic_yards'].forEach(f=>{if(Math.abs((ai[f]||0)-(user[f]||0))>0.0001)diff[f]={ai:ai[f],user:user[f]};});['name','notes'].forEach(f=>{if((ai[f]||'')!==(user[f]||''))diff[f]={ai:ai[f],user:user[f]};});return diff;}
     function downloadJson(data,filename){const b=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=filename;a.click();URL.revokeObjectURL(u);}
     function dateStamp(){return new Date().toISOString().split('T')[0];}
-    function resetForm(){fileInput.value='';sessionState=null;loadingSection.style.display='none';messageArea.innerHTML='';document.getElementById('filenameDisplay').textContent='PDF only · Drag & drop or click · 100 MB max';switchTab('upload');}
+    function resetForm(){fileInput.value='';sessionState=null;snippetImages=[];renderSnippetPreviews();loadingSection.style.display='none';messageArea.innerHTML='';document.getElementById('filenameDisplay').textContent='PDF only · Drag & drop or click · 100 MB max';switchTab('upload');}
     function showMessage(message,type){const div=document.createElement('div');div.className=`msg ${type}`;div.textContent=message;messageArea.innerHTML='';messageArea.appendChild(div);}
     function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+    /**
+     * parseUnstructuredAnalysis
+     * Attempts to extract concrete element rows from Claude's prose/markdown
+     * when the JSON parsing step in the backend failed.
+     *
+     * Recognises common Claude output patterns like:
+     *   - "Foundation Slab: 40' × 60' × 1.0' = 2400 cf = 88.89 cy"
+     *   - Markdown tables  | Element | Width | Length | Depth | Qty | CY |
+     *   - Numbered/bulleted lists with dimension callouts
+     *   - "Element ID (F1): …  W=4ft  L=20ft  D=1.5ft  Qty=3  = 13.33 CY"
+     */
+    function parseUnstructuredAnalysis(text) {
+        if (!text) return { elements: [], total_cubic_yards: 0 };
+
+        const elements = [];
+        let total_cubic_yards = 0;
+
+        // ── 1. Detect and parse a markdown table ─────────────────────────────
+        // Looks for a line starting with | that has at least 4 pipe-separated cells
+        const tableLines = text.split('\n').filter(l => l.trim().startsWith('|') && l.includes('|'));
+        if (tableLines.length >= 3) {
+            // Find header row (first line) and skip separator (second line with ---)
+            const dataLines = tableLines.filter(l => !l.match(/^\s*\|[\s\-|]+\|\s*$/));
+            if (dataLines.length >= 2) {
+                // Identify column positions from header
+                const headers = dataLines[0].split('|').map(h => h.trim().toLowerCase()).filter(Boolean);
+                const colIdx = {
+                    name:   headers.findIndex(h => /name|element|component|item|description/.test(h)),
+                    width:  headers.findIndex(h => /width|w\b/.test(h)),
+                    length: headers.findIndex(h => /length|l\b/.test(h)),
+                    depth:  headers.findIndex(h => /depth|thick|d\b|height|h\b/.test(h)),
+                    qty:    headers.findIndex(h => /qty|count|num|quantity/.test(h)),
+                    cf:     headers.findIndex(h => /cu.*ft|cft|cubic.?f/.test(h)),
+                    cy:     headers.findIndex(h => /cu.*yd|cyd|cubic.?y|cy\b/.test(h)),
+                    notes:  headers.findIndex(h => /note|remark|comment|assump/.test(h)),
+                };
+                dataLines.slice(1).forEach(line => {
+                    const cells = line.split('|').map(c => c.trim()).filter((c, i) => i > 0);
+                    if (!cells.length) return;
+                    const get = (idx) => idx >= 0 && idx < cells.length ? cells[idx] : '';
+                    const num = (s) => parseFloat(s.replace(/[^\d.\-]/g, '')) || 0;
+                    const name = get(colIdx.name >= 0 ? colIdx.name : 0);
+                    if (!name || name.match(/^[\-=]+$/)) return;
+                    const width_ft  = num(get(colIdx.width));
+                    const length_ft = num(get(colIdx.length));
+                    const depth_ft  = num(get(colIdx.depth));
+                    const qty       = num(get(colIdx.qty)) || 1;
+                    let cubic_yards = num(get(colIdx.cy));
+                    let cubic_feet  = num(get(colIdx.cf));
+                    // Recompute if columns missing
+                    if (!cubic_feet && width_ft && length_ft && depth_ft) cubic_feet = width_ft * length_ft * depth_ft * qty;
+                    if (!cubic_yards && cubic_feet) cubic_yards = cubic_feet / 27;
+                    if (!cubic_yards && !cubic_feet) return; // skip header/total rows with no data
+                    const notes = get(colIdx.notes);
+                    // Skip total/summary rows
+                    if (/total|subtotal|grand/i.test(name)) {
+                        if (cubic_yards > total_cubic_yards) total_cubic_yards = cubic_yards;
+                        return;
+                    }
+                    elements.push({ name, width_ft, length_ft, depth_ft, qty, cubic_feet: parseFloat(cubic_feet.toFixed(2)), cubic_yards: parseFloat(cubic_yards.toFixed(4)), notes });
+                });
+                if (elements.length) {
+                    if (!total_cubic_yards) total_cubic_yards = elements.reduce((s, e) => s + e.cubic_yards, 0);
+                    return { elements, total_cubic_yards: parseFloat(total_cubic_yards.toFixed(4)) };
+                }
+            }
+        }
+
+        // ── 2. Line-by-line heuristic parsing ────────────────────────────────
+        // Patterns:
+        //  "Foundation Slab: 40 × 60 × 1.0 ft = 2400 cf = 88.89 CY"
+        //  "- Column Footings (x6): W=4 L=4 D=1.5 → 5.33 CY"
+        //  "F1 – Slab on Grade: 100'×40'×0.5' qty=1 → 74.07 CY"
+        const lines = text.split('\n');
+
+        // CY extraction helper
+        const extractCY = (s) => {
+            const m = s.match(/(\d[\d,]*\.?\d*)\s*(?:cubic\s*yards?|cy\b)/i);
+            return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+        };
+        const extractCF = (s) => {
+            const m = s.match(/(\d[\d,]*\.?\d*)\s*(?:cubic\s*feet?|cu\.?\s*ft\.?|cf\b)/i);
+            return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+        };
+        const extractDims = (s) => {
+            // "40 × 60 × 1.0" or "40' x 60' x 1.0'" or "W=40 L=60 D=1"
+            let w = null, l = null, d = null, q = 1;
+            // W= L= D= style
+            const wm = s.match(/w(?:idth)?\s*=\s*([\d.]+)/i);
+            const lm = s.match(/l(?:ength)?\s*=\s*([\d.]+)/i);
+            const dm = s.match(/d(?:epth|ep|hick)?\s*=\s*([\d.]+)/i);
+            if (wm) w = parseFloat(wm[1]);
+            if (lm) l = parseFloat(lm[1]);
+            if (dm) d = parseFloat(dm[1]);
+            // qty
+            const qm = s.match(/(?:qty|q|x|×|\*)\s*=?\s*(\d+)\b/i) || s.match(/\((\d+)\s*(?:ea|pcs?|each|total)?\)/i);
+            if (qm) q = parseInt(qm[1]);
+            // dim × dim × dim  (handles ×, x, X, 'x', ' x ')
+            if (!w || !l) {
+                const crossM = s.match(/([\d.]+)\s*(?:ft|'|″|")?\s*[×xX]\s*([\d.]+)\s*(?:ft|'|″|")?\s*[×xX]\s*([\d.]+)/);
+                if (crossM) { w = parseFloat(crossM[1]); l = parseFloat(crossM[2]); d = parseFloat(crossM[3]); }
+            }
+            // Convert inches to feet for depths like 6" or 6 in
+            if (d && d > 3) {
+                // If likely in inches (> 3 and no explicit "ft"), convert
+                const hasInch = s.match(/(\d[\d.]*)\s*(?:in(?:ches?)?|")/i);
+                if (hasInch && parseFloat(hasInch[1]) === d) d = d / 12;
+            }
+            return { w, l, d, q };
+        };
+
+        // Identify element name from a line (strip leading bullets, IDs, dashes)
+        const extractName = (line) => {
+            return line
+                .replace(/^[\s\-\*\•\d\.\)]+/, '')   // strip bullets/numbers
+                .replace(/\b[A-Z]\d+\s*[\-–:]\s*/, '') // strip element IDs like F1-, W2:
+                .replace(/\s*[:\(].*$/, '')             // strip trailing colon content
+                .trim()
+                .split(/\s{3,}/)[0]                     // take first token if tabular
+                .replace(/\s+\d+$/, '')                 // strip trailing numbers
+                .trim();
+        };
+
+        lines.forEach(line => {
+            const raw = line.trim();
+            if (!raw || raw.length < 6) return;
+            // Skip section headers, legend lines, or lines that are clearly not elements
+            if (/^#+\s/.test(raw)) return;
+            if (/^(step|note|assumption|total|summary|legend|page|drawing|sheet)/i.test(raw)) {
+                // Extract total if present
+                const cy = extractCY(raw);
+                if (cy && cy > total_cubic_yards && /total/i.test(raw)) total_cubic_yards = cy;
+                return;
+            }
+
+            const cy = extractCY(raw);
+            const cf = extractCF(raw);
+            const { w, l, d, q } = extractDims(raw);
+
+            // Need at least a CY value to create a row
+            if (!cy && !cf && !(w && l && d)) return;
+
+            let cubic_yards = cy || 0;
+            let cubic_feet  = cf || 0;
+            if (!cubic_feet && w && l && d) cubic_feet = w * l * d * q;
+            if (!cubic_yards && cubic_feet) cubic_yards = cubic_feet / 27;
+            if (!cubic_yards) return;
+
+            const name = extractName(raw) || 'Concrete Element';
+            if (name.length < 3) return;
+
+            // Extract notes — anything in parentheses or after "assumed"/"note:"
+            let notes = '';
+            const noteM = raw.match(/(?:assumed?|note|:\s*)([^()]{10,})/i);
+            if (noteM) notes = noteM[1].trim().replace(/\.$/, '');
+
+            elements.push({
+                name,
+                width_ft:  parseFloat((w || 0).toFixed(2)),
+                length_ft: parseFloat((l || 0).toFixed(2)),
+                depth_ft:  parseFloat((d || 0).toFixed(2)),
+                qty: q || 1,
+                cubic_feet: parseFloat(cubic_feet.toFixed(2)),
+                cubic_yards: parseFloat(cubic_yards.toFixed(4)),
+                notes,
+            });
+        });
+
+        // Deduplicate by name+cy (Claude sometimes repeats summary lines)
+        const seen = new Set();
+        const unique = elements.filter(e => {
+            const key = `${e.name.toLowerCase()}|${e.cubic_yards}`;
+            if (seen.has(key)) return false;
+            seen.add(key); return true;
+        });
+
+        if (!total_cubic_yards) total_cubic_yards = unique.reduce((s, e) => s + e.cubic_yards, 0);
+        return { elements: unique, total_cubic_yards: parseFloat(total_cubic_yards.toFixed(4)) };
+    }
 
     // ── History ───────────────────────────────────────────
     function loadHistoryArr() {
