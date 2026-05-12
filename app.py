@@ -171,6 +171,65 @@ _TAKEOFF_TOOL = {
 }
 
 
+# Default 5% waste/overbreak factor — matches SKILL.md convention. Override
+# with WASTE_FACTOR=1.00 in env to disable, or any other value (e.g. 1.10).
+WASTE_FACTOR = float(os.environ.get("WASTE_FACTOR", "1.05"))
+# Drift threshold above which Claude's value triggers an audit entry.
+VOLUME_DRIFT_THRESHOLD = 0.01  # 1%
+
+
+def _verify_element_volumes(elements, waste_factor=WASTE_FACTOR):
+    """Replace Claude's per-element cubic_feet / cubic_yards with values
+    computed from width × length × depth × qty in Python. Returns the audit
+    list so the response can surface every override that happened.
+
+    The geometric truth is w·l·d·qty in cubic feet. Claude's job is to
+    extract dimensions; arithmetic on those dimensions is Python's job.
+    """
+    audit = []
+    for el in elements or []:
+        try:
+            w = float(el.get("width_ft") or 0)
+            l = float(el.get("length_ft") or 0)
+            d = float(el.get("depth_ft") or 0)
+            q = float(el.get("qty") or 1)
+        except (TypeError, ValueError):
+            continue
+
+        raw_cf = w * l * d * q
+        verified_cf = round(raw_cf * waste_factor, 2)
+        verified_cy = round(verified_cf / 27.0, 2)
+
+        try:
+            claude_cf = float(el.get("cubic_feet") or 0)
+            claude_cy = float(el.get("cubic_yards") or 0)
+        except (TypeError, ValueError):
+            claude_cf = claude_cy = 0.0
+
+        def _drift(a, b):
+            if b == 0:
+                return 0.0 if a == 0 else float("inf")
+            return abs(a - b) / abs(b)
+
+        cf_drift = _drift(claude_cf, verified_cf)
+        cy_drift = _drift(claude_cy, verified_cy)
+
+        if cf_drift > VOLUME_DRIFT_THRESHOLD or cy_drift > VOLUME_DRIFT_THRESHOLD:
+            audit.append({
+                "element": el.get("name", "(unnamed)"),
+                "claude_cubic_feet": claude_cf,
+                "verified_cubic_feet": verified_cf,
+                "claude_cubic_yards": claude_cy,
+                "verified_cubic_yards": verified_cy,
+                "formula": f"{w} × {l} × {d} × {q} × {waste_factor} = {verified_cf} CF",
+            })
+
+        el["cubic_feet"] = verified_cf
+        el["cubic_yards"] = verified_cy
+
+    return audit
+
+
 def extract_quantities_with_claude(pdf_text, filename):
     """Two-turn conversation: identify elements, then compute volumes."""
     if client is None:
@@ -285,7 +344,11 @@ Call the return_takeoff tool with all elements and the summary totals."""
         parsed = _parse_json_block(raw)
 
     if parsed:
-        # Recompute totals server-side as a sanity check
+        # Deterministic Python recompute of every element's volume from the
+        # extracted dimensions. Replaces Claude's arithmetic (which drifts ~1%
+        # across multiple trials) with a single canonical computation.
+        audit = _verify_element_volumes(parsed.get("elements") or [])
+
         total_cf = 0.0
         total_cy = 0.0
         for el in parsed.get("elements", []) or []:
@@ -297,6 +360,13 @@ Call the return_takeoff tool with all elements and the summary totals."""
         parsed.setdefault("summary", {})
         parsed["summary"]["total_cubic_feet"] = round(total_cf, 2)
         parsed["summary"]["total_cubic_yards"] = round(total_cy, 2)
+        parsed["summary"]["verification"] = {
+            "applied": True,
+            "waste_factor": WASTE_FACTOR,
+            "drift_threshold_pct": VOLUME_DRIFT_THRESHOLD * 100,
+            "overrides": audit,
+            "override_count": len(audit),
+        }
         # When the tool returned no elements, attach the first-turn prose so
         # the frontend parser can attempt to extract rows from it.
         if not parsed.get("elements") and prose_response:
