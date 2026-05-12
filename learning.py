@@ -18,6 +18,19 @@ _DEFAULT_LESSONS = "/data/lessons.jsonl" if os.path.isdir("/data") else os.path.
 LESSONS_FILE = os.environ.get("LESSONS_FILE", _DEFAULT_LESSONS)
 MAX_LESSONS_IN_PROMPT = 12
 
+# One-time seed: if the persistent file doesn't exist yet but the repo ships
+# a starter lessons.jsonl, copy it over so the deployed app starts with the
+# accumulated lessons instead of empty.
+_SEED = os.path.join(_HERE, "lessons.jsonl")
+if LESSONS_FILE != _SEED and not os.path.exists(LESSONS_FILE) and os.path.exists(_SEED):
+    try:
+        os.makedirs(os.path.dirname(LESSONS_FILE), exist_ok=True)
+        with open(_SEED, "r", encoding="utf-8") as src, open(LESSONS_FILE, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+        print(f"[learning] Seeded {LESSONS_FILE} from repo starter")
+    except OSError as e:
+        print(f"[learning] Seed failed: {e}")
+
 
 def load_lessons() -> list:
     if not os.path.exists(LESSONS_FILE):

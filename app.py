@@ -23,6 +23,11 @@ from learning import format_lessons_for_prompt, trigger_lesson_extraction, load_
 _HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_HERE, '.env'), override=True)
 
+# Persistent data directory. On Render, /data is a mounted disk that survives
+# redeploys. Locally we fall back to the project directory.
+DATA_DIR = "/data" if os.path.isdir("/data") else _HERE
+os.makedirs(DATA_DIR, exist_ok=True)
+
 app = Flask(__name__)
 CORS(app, origins='*', allow_headers=['Content-Type'], methods=['GET', 'POST', 'OPTIONS'])
 app.config['UPLOAD_FOLDER'] = os.path.join(_HERE, 'uploads')
@@ -341,14 +346,14 @@ def save_feedback():
         # Extract image snippets before logging — keep JSONL compact
         snippet_images = payload.pop('snippet_images', []) or []
 
-        log_path = os.path.join(_HERE, 'feedback_log.jsonl')
+        log_path = os.path.join(DATA_DIR, 'feedback_log.jsonl')
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(payload) + '\n')
 
         # Persist snippet images to disk so they aren't lost
         safe_snippets = []
         if snippet_images:
-            snippets_dir = os.path.join(_HERE, 'uploads', 'snippets')
+            snippets_dir = os.path.join(DATA_DIR, 'snippets')
             os.makedirs(snippets_dir, exist_ok=True)
             uid = hashlib.md5(os.urandom(8)).hexdigest()[:8]
             for idx, img in enumerate(snippet_images[:4]):
