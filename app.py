@@ -31,7 +31,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 app = Flask(__name__)
 CORS(app, origins='*', allow_headers=['Content-Type'], methods=['GET', 'POST', 'OPTIONS'])
 app.config['UPLOAD_FOLDER'] = os.path.join(_HERE, 'uploads')
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max
+app.config['MAX_CONTENT_LENGTH'] = 250 * 1024 * 1024  # 250MB max
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -505,7 +505,7 @@ def upload_file():
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify({'error': 'File too large (max 100MB)'}), 413
+    return jsonify({'error': 'File too large (max 250MB)'}), 413
 
 
 @app.errorhandler(404)

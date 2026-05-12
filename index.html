@@ -561,7 +561,7 @@
         </div>
         <div style="flex:1;min-width:0;">
             <div class="upload-title" style="font-size:18px;margin-bottom:3px;">Upload Construction Drawing</div>
-            <div class="upload-hint" style="margin-bottom:0;" id="filenameDisplay">PDF only · Drag &amp; drop or click · 100 MB max</div>
+            <div class="upload-hint" style="margin-bottom:0;" id="filenameDisplay">PDF only · Drag &amp; drop or click · 250 MB max</div>
         </div>
         <input type="file" id="fileInput" accept=".pdf" />
         <div class="btn-row" style="flex-shrink:0;" onclick="event.stopPropagation()">
@@ -1153,7 +1153,7 @@
     function buildCorrectionsDiff(ai,user){const diff={};['width_ft','length_ft','depth_ft','qty','cubic_feet','cubic_yards'].forEach(f=>{if(Math.abs((ai[f]||0)-(user[f]||0))>0.0001)diff[f]={ai:ai[f],user:user[f]};});['name','notes'].forEach(f=>{if((ai[f]||'')!==(user[f]||''))diff[f]={ai:ai[f],user:user[f]};});return diff;}
     function downloadJson(data,filename){const b=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=filename;a.click();URL.revokeObjectURL(u);}
     function dateStamp(){return new Date().toISOString().split('T')[0];}
-    function resetForm(){fileInput.value='';sessionState=null;snippetImages=[];renderSnippetPreviews();loadingSection.style.display='none';messageArea.innerHTML='';document.getElementById('filenameDisplay').textContent='PDF only · Drag & drop or click · 100 MB max';switchTab('upload');}
+    function resetForm(){fileInput.value='';sessionState=null;snippetImages=[];renderSnippetPreviews();loadingSection.style.display='none';messageArea.innerHTML='';document.getElementById('filenameDisplay').textContent='PDF only · Drag & drop or click · 250 MB max';switchTab('upload');}
     function showMessage(message,type){const div=document.createElement('div');div.className=`msg ${type}`;div.textContent=message;messageArea.innerHTML='';messageArea.appendChild(div);}
     function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
