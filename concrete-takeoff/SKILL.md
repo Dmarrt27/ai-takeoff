@@ -39,6 +39,70 @@ For each element, extract or derive:
 -For concrete quantities, almost all important dimensions will be listed on "S" sheets
 - Record each element with a unique identifier (e.g., F1, F2, W1, S1, C1)
 
+### Step 2.5 — Classify Geometry BEFORE Calculating (Mandatory)
+
+Before applying any volume formula you MUST output a one-line geometry classification for every element. Default-treating everything as rectangular is the #1 cause of takeoff errors on this skill — sloped slabs, stepped footings, and tapered walls are repeatedly under- or over-counted when this step is skipped.
+
+For each element, classify as ONE of:
+
+| Tag | When to use | Volume model |
+|---|---|---|
+| `RECT_PRISM` | Constant thickness in all directions | L × W × T |
+| `TRAPEZOIDAL_PRISM` | Thickness varies LINEARLY across one plan dimension (e.g. sloped floor of a wet well, tapered mat, sumps with sloped bottom) | 0.5 × (d_min + d_max) × L × W |
+| `STEPPED_PRISM` | Thickness changes in discrete steps | Sum of rectangular sub-volumes |
+| `TAPERED_WALL` | Wall thickness varies from top to bottom (battered) | 0.5 × (t_top + t_bot) × H × L |
+| `CYLINDER` | Round column / caisson | π × r² × H |
+| `FRUSTUM` | Round pier with varying radius (rare) | (π × H / 3) × (R² + R·r + r²) |
+| `CUSTOM` | Anything else — break into sub-shapes and document |
+
+**Hard rule — trigger words for `TRAPEZOIDAL_PRISM`:** If the section drawing contains ANY of the following, the element is trapezoidal, NEVER rectangular:
+
+- A `% SLOPE` annotation (e.g. "5% SLOPE", "2% SLOPE TO DRAIN")
+- A single labeled thickness with `TYP` next to a non-horizontal top or bottom face
+- Two different thicknesses labeled at opposite ends of the same slab
+- A "slope to drain", "slope to sump", "create slope" note
+- A leader line showing depth at one end and a separate leader showing depth at the other end
+- The bottom of the slab is flat (foundation requirement) but the top is sloped, or vice versa
+
+When any of those are present, output the classification with the exact trigger you saw:
+> Element WW-FL: `TRAPEZOIDAL_PRISM` (trigger: "5% SLOPE" annotation on Section B; min thickness "11\" TYP")
+
+### Step 2.6 — Derive Implied Dimensions from Cross-Referenced Sheets (Mandatory)
+
+It is **routine** for a section drawing to omit one or more dimensions required by the volume formula. The omitted dimension must be DERIVED, with the derivation chain shown, before any volume math runs. Never substitute a guess or "reasonable default" for an implied dimension.
+
+A dimension is **implied** (not "shown") when any of these are true:
+
+1. The dimension is needed for the volume formula but no leader/arrow on the current section labels it directly
+2. The current section shows only outer-to-outer dimensions; you need an interior dimension (subtract wall thicknesses)
+3. The current section shows a span but the slope only acts on a portion of that span (subtract sump width / step offset / wall projection)
+4. The dimension you need is in a different orientation than this section view (look on the plan view or perpendicular section on the same sheet)
+5. A `TYP` callout implies one dimension and the other end requires slope-based derivation
+
+**Derivation protocol — show all four lines for every implied dimension:**
+
+```
+Implied dim   : <label, e.g. "slope-run length for wet well floor">
+Needed for    : <which volume calc>
+Source        : <sheet ID / section ID where each ingredient was read>
+Derivation    : <explicit arithmetic — outer minus walls minus offsets, or
+                 min_depth + (slope% × run), etc.>
+```
+
+Examples of the two most common derivations on civil/industrial work:
+
+| Pattern | Derivation |
+|---|---|
+| Max depth of a sloped slab | `d_max = d_min + (slope% / 100) × slope_run` |
+| Interior chamber dimension | `D_int = D_outer - Σ(wall thicknesses + offsets)` |
+| Slope run when slab doesn't cover full span | `run = interior_span - sump_width - step_offsets` |
+| Perpendicular plan dim missing from this section | Read from plan view (Section A) or opposite section on same sheet |
+
+Cross-reference rule: when a dimension is missing on Section B, **look at Section A and any plan/key views on the same sheet number before scaling**. Scaling is the last resort and must be flagged as `confidence: low`.
+
+A reusable Python helper for these computations is bundled at:
+`concrete-takeoff/scripts/trapezoidal_volume.py` — see the `_example_wet_well_sloped_floor()` block for a fully worked derivation chain that produces 138 CY on the City of Rifle wet well floor.
+
 ### Step 3 — Calculate Quantities
 
 Apply the following formulas. Always show your math inline so the user can verify.
@@ -50,13 +114,19 @@ Convert all dimensions to feet first, then:
 |---|---|
 | Rectangular footing | L × W × D ÷ 27 = CY |
 | Continuous wall footing | L × W × D ÷ 27 = CY |
-| Slab on grade | L × W × T ÷ 27 = CY |
-| Retaining / shear wall | L × H × T ÷ 27 = CY |
+| Slab on grade (constant thickness) | L × W × T ÷ 27 = CY |
+| **Sloped slab / trapezoidal prism** | **0.5 × (d_min + d_max) × L × W ÷ 27 = CY** |
+| Stepped slab / footing | Σ (L_i × W_i × T_i) ÷ 27 = CY |
+| Retaining / shear wall (constant) | L × H × T ÷ 27 = CY |
+| Tapered (battered) wall | 0.5 × (t_top + t_bot) × H × L ÷ 27 = CY |
 | Column (rectangular) | W × D × H ÷ 27 = CY |
 | Column (round) | π × r² × H ÷ 27 = CY |
 | Beam | W × D × L ÷ 27 = CY |
 | Pier / caisson (round) | π × r² × H ÷ 27 = CY |
 | Pier / caisson (rectangular) | L × W × H ÷ 27 = CY |
+| Frustum (varying-radius pier) | (π × H / 3) × (R² + R·r + r²) ÷ 27 = CY |
+
+> **Unit hygiene for trapezoidal calcs:** if any input dimension is in inches, divide the raw cubic-inch product by **46,656** (not 27) to get CY. Mixing inches and feet in the same formula is the second-most-common error after rectangular default — always convert first.
 
 Add a **5% waste/overbreak factor** to all volumes unless the user specifies otherwise.
 
@@ -164,12 +234,81 @@ Apply these defaults unless the user specifies otherwise:
 ## Quality Checks
 
 Before presenting output, verify:
-- [ ] All CY calculations divided by 27 (not 9 or 3)
+- [ ] Every element has an explicit geometry classification (Step 2.5) — no element silently treated as rectangular
+- [ ] Any element with a `% SLOPE` annotation, "TYP" thickness paired with a sloping face, or two different end thicknesses is classified as `TRAPEZOIDAL_PRISM` and computed with `0.5 × (d_min + d_max) × L × W`
+- [ ] Every implied dimension has a 4-line derivation block (label / needed-for / source / derivation arithmetic)
+- [ ] Inch-based trapezoidal volumes divided by 46,656 (not 27); foot-based by 27
+- [ ] All CY calculations divided by the correct cubic-units-to-CY constant
 - [ ] Round columns use π × r² (not diameter²)
 - [ ] Waste factor applied to all volumes
 - [ ] Rebar lap splice factor applied
 - [ ] Formwork excludes earth-formed and top/finished surfaces
 - [ ] Subtotals and project total match sum of line items
+
+---
+
+## Worked Example — Wet Well Sloped Floor (Reference Case)
+
+This is the canonical example for sloped-slab handling. Whenever you see a wet well, vault, sump, or any slab with a `% SLOPE` annotation, follow this exact derivation pattern.
+
+**Drawing inputs (City of Rifle Lift Station, Sheet S4, Section B):**
+- `11" TYP` — minimum slab thickness at high end of slope (labeled)
+- `5% SLOPE` — slope annotation on the top face of the slab (labeled)
+- `53'-3"` — interior dimension of the wet well along the slope direction (labeled)
+- `4'-3"` and `3'-7"` — sump offset and wall-step segments at the low end (labeled)
+- Perpendicular plan dimension: NOT labeled on Section B — must be read from Section A (plan view) on the same sheet → 480"
+
+**Step 2.5 — Geometry classification:**
+> Element WW-FL: `TRAPEZOIDAL_PRISM` (trigger: "5% SLOPE" annotation; min thickness "11\" TYP" at one end)
+
+**Step 2.6 — Implied dimension derivations:**
+
+```
+Implied dim   : Slope-run length (the plan dim across which depth varies)
+Needed for    : L in V = 0.5 × (d_min + d_max) × L × W
+Source        : S4 / Section B — interior 53'-3" minus the 4'-3" sump offset
+                and 3'-7" wall step at the low end
+Derivation    : 53'-3" − (4'-3" + 3'-7") = 639" − 94" = 545"
+```
+
+```
+Implied dim   : Maximum slab depth (deep end of the slope)
+Needed for    : d_max in trapezoidal volume formula
+Source        : S4 / Section B — "5% SLOPE" annotation, applied across 545" run
+Derivation    : 11" + (0.05 × 545") = 11" + 27.25" = 38.25"   (≈ 38.5")
+```
+
+```
+Implied dim   : Perpendicular plan width (constant-depth direction)
+Needed for    : W in trapezoidal volume formula
+Source        : S4 / Section A (plan view) — interior chamber width
+                (NOT shown on Section B)
+Derivation    : Read directly from Section A dimensioning = 480"
+```
+
+**Step 3 — Volume calculation:**
+
+```
+V = 0.5 × (11" + 38.25") × 545" × 480"
+  = 0.5 × 49.25" × 545" × 480"
+  = 6,441,900 in³
+  = 6,441,900 ÷ 46,656
+  = 138.07 CY (raw)
+  × 1.05 waste factor
+  = 144.98 CY (with 5% waste)
+```
+
+**Final entry in takeoff table:**
+
+| Element ID | Description | Geometry | d_min | d_max | L | W | CY (raw) | CY (+5%) |
+|---|---|---|---|---|---|---|---|---|
+| WW-FL | Wet well sloped floor | TRAPEZOIDAL_PRISM | 11" | 38.25" | 545" | 480" | 138.07 | 144.98 |
+
+> **Common failure modes this example guards against:**
+> 1. Computing as `L × W × 11"` (rectangular default) — gives 90 CY, undercount of ~35%
+> 2. Computing as `L × W × 38.5"` (max-depth default) — gives 315 CY, overcount of 130%
+> 3. Using the labeled 53'-3" / 639" as slope-run without subtracting the sump offset — gives `d_max = 42.95"` and volume ≈ 150 CY (10% overcount)
+> 4. Mixing inches and feet in the formula and dividing by 27 — gives ~3,600 CY (units error)
 
 ---
 
