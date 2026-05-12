@@ -1,0 +1,39 @@
+# Secrets — never commit
+.env
+*.env.local
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Uploads (runtime, regenerated)
+uploads/
+
+# Claude Code local settings
+.claude/
+
+# Runtime feedback data — should live on the persistent disk, not git
+feedback_log.jsonl
+takeoff_feedback_*.json
+
+# Backup files
+*.bak

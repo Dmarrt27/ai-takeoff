@@ -61,6 +61,41 @@ def extract_corrections(feedback_payload: dict) -> list:
     return corrections
 
 
+def _build_lesson_messages(corrections: list, source_file: str, human_notes: str = "", images: list = None) -> list:
+    """Build the messages list for lesson extraction.
+
+    When images are provided (drawing snippets from the user's feedback), they
+    are included as base64 image blocks so Claude can see the visual context
+    that caused the extraction error and write a more precise lesson.
+    """
+    prompt_text = _build_lesson_prompt(corrections, source_file, human_notes)
+
+    if not images:
+        return [{"role": "user", "content": prompt_text}]
+
+    content = [{"type": "text", "text": prompt_text + "\n\nThe user attached the following drawing snippet(s) to illustrate the correction:"}]
+    for img in images[:4]:
+        data_url = img.get("data_url", "")
+        if not data_url.startswith("data:"):
+            continue
+        try:
+            header, b64_data = data_url.split(",", 1)
+            media_type = header.split(":")[1].split(";")[0]
+            if media_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                media_type = "image/jpeg"
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64_data},
+            })
+            caption = img.get("caption", "").strip()
+            if caption:
+                content.append({"type": "text", "text": f"[Caption: {caption}]"})
+        except Exception as e:
+            print(f"[learning] Skipping malformed snippet: {e}")
+
+    return [{"role": "user", "content": content}]
+
+
 def _build_lesson_prompt(corrections: list, source_file: str, human_notes: str = "") -> str:
     correction_block = ""
     for ai, user, note in corrections[:5]:
@@ -90,21 +125,25 @@ def _build_lesson_prompt(corrections: list, source_file: str, human_notes: str =
     )
 
 
-def generate_and_save_lesson(feedback_payload: dict, client, model: str) -> bool:
-    """Generate a lesson from corrections and append it to lessons.jsonl."""
+def generate_and_save_lesson(feedback_payload: dict, client, model: str, images: list = None) -> bool:
+    """Generate a lesson from corrections and append it to lessons.jsonl.
+
+    When images is provided (drawing snippets), Claude receives a multimodal
+    prompt so it can ground the lesson in the actual visual evidence.
+    """
     corrections = extract_corrections(feedback_payload)
     if not corrections:
         return False
 
     source_file = feedback_payload.get("source_file", "unknown")
     human_notes = (feedback_payload.get("session") or {}).get("human_notes") or ""
-    prompt = _build_lesson_prompt(corrections, source_file, human_notes)
+    messages = _build_lesson_messages(corrections, source_file, human_notes, images)
 
     try:
         resp = client.messages.create(
             model=model,
             max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
         )
         lesson_text = resp.content[0].text.strip()
     except Exception as e:
@@ -118,6 +157,7 @@ def generate_and_save_lesson(feedback_payload: dict, client, model: str) -> bool
         "lesson": lesson_text,
         "ai_example": ai_example,
         "user_example": user_example,
+        "has_snippets": bool(images),
     }
     with open(LESSONS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -126,11 +166,11 @@ def generate_and_save_lesson(feedback_payload: dict, client, model: str) -> bool
     return True
 
 
-def trigger_lesson_extraction(feedback_payload: dict, client, model: str) -> None:
+def trigger_lesson_extraction(feedback_payload: dict, client, model: str, images: list = None) -> None:
     """Fire-and-forget: extract a lesson from feedback in a background thread."""
     t = threading.Thread(
         target=generate_and_save_lesson,
-        args=(feedback_payload, client, model),
+        args=(feedback_payload, client, model, images),
         daemon=True,
     )
     t.start()
