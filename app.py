@@ -10,7 +10,7 @@ import hashlib
 import traceback
 import threading
 
-from flask import Flask, render_template, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import PyPDF2
@@ -210,7 +210,11 @@ Respond with ONLY a JSON object in exactly this shape (no prose, no markdown fen
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return jsonify({
+        "ok": True,
+        "service": "AI Takeoff API",
+        "endpoints": ["/api/health", "/api/upload", "/api/feedback", "/api/lessons"],
+    })
 
 
 @app.route('/api/health')
