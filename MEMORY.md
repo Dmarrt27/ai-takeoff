@@ -6,7 +6,7 @@ Continuity record for future Claude sessions working on this project. Read this 
 
 - **Product:** Concrete quantity takeoff from construction-drawing PDFs. User uploads a bid set, Claude extracts concrete elements (footings, slabs, walls, columns, etc.), computes volumes in cubic yards, and shows them in an editable table. Corrections feed back into a lessons file that's injected into future analyses.
 - **Owner:** Dmarrt27 (GitHub) — Martinez Western
-- **GitHub repo:** [Dmarrt27/Claudev2](https://github.com/Dmarrt27/Claudev2), default branch `main`
+- **GitHub repo:** [Dmarrt27/ai-takeoff](https://github.com/Dmarrt27/ai-takeoff), default branch `main`. (Repo was originally `Claudev2`; renamed 2026-05-13. GitHub auto-redirects the old URL but new pushes should use the new name.)
 - **Customer-facing URL:** https://martinezwesternaitakeoff.com (custom domain on Netlify)
 
 ## Architecture
@@ -15,21 +15,24 @@ Three deployments wired together via GitHub auto-deploy:
 
 | Layer | Service | What it serves |
 |---|---|---|
-| Frontend | Netlify | `index.html` at `martinezwesternaitakeoff.com` |
+| Frontend | Cloudflare Workers (with Static Assets) | `index.html` at `martinezwesternaitakeoff.com` |
 | Backend | Render | Flask API at `ai-takeoff-api.onrender.com` |
-| Source of truth | GitHub | `Dmarrt27/Claudev2` `main` branch |
+| Source of truth | GitHub | `Dmarrt27/ai-takeoff` `main` branch |
 
-A push to `main` triggers both Netlify and Render auto-deploys. **Don't put `render_template('index.html')` back in `app.py`'s root route** — Netlify owns the HTML; the Flask root returns a JSON status object.
+A push to `main` triggers both Cloudflare and Render auto-deploys. **Don't put `render_template('index.html')` back in `app.py`'s root route** — Cloudflare owns the HTML; the Flask root returns a JSON status object.
+
+Cloudflare config lives in `wrangler.jsonc` at repo root (`"assets": { "directory": "." }` — serves files from the repo root). The Worker name is `ai-takeoff`; its preview URL is `ai-takeoff.dylanmartinez27.workers.dev`. DNS for `martinezwesternaitakeoff.com` is managed by Cloudflare (zone added 2026-05-13; nameservers `lisa.ns.cloudflare.com` + `titan.ns.cloudflare.com`). MX records and SPF TXT for Namecheap email forwarding are preserved in the Cloudflare DNS zone.
 
 ## Repo Layout (current)
 
-- `app.py` — Flask backend, all `/api/*` endpoints, Anthropic SDK calls, volume verification
+- `app.py` — Flask backend, all `/api/*` endpoints, Anthropic SDK calls, volume verification. PDF text extraction uses **pypdfium2** with explicit per-page `close()` calls; was PyPDF2 until 2026-05-13 (swapped because PyPDF2 held the entire PDF tree in RAM, OOMing Render on image-heavy drawings)
 - `index.html` — single-file frontend, vanilla JS, served by Netlify
 - `learning.py` — extracts a "lesson" from each user correction, appends to `lessons.jsonl`, injects lessons into the Turn 1 prompt
 - `concrete-takeoff/SKILL.md` — system prompt fragment loaded at boot; encodes the full extraction workflow (15 KB, ~6.8K chars after frontmatter strip → wait, now ~15K after Step 2.5/2.6 update)
 - `concrete-takeoff/scripts/trapezoidal_volume.py` — geometry helpers for sloped/non-rectangular elements. Currently a **reference module only** — not imported by `app.py`. If you want the AI to call it, reference its formulas from inside `SKILL.md`; if you want Python to call it for canonical math, import and wire it into `_verify_element_volumes` (currently only handles rectangular `w × l × d × qty`).
 - `lessons.jsonl` — starter seed for `/data/lessons.jsonl`; the deployed app auto-copies this on first boot
-- `render.yaml` — Render blueprint; current Gunicorn timeout is **300s** (was 120s; raised because 12MB PDFs take ~2 min just to upload on free-tier bandwidth)
+- `render.yaml` — Render blueprint; current Gunicorn config is **`--workers 1 --worker-class gthread --threads 4 --timeout 300`**. Workers dropped 2→1 on 2026-05-13 to halve peak memory under concurrent uploads (Claude API calls are IO-bound, threads handle concurrency fine). Timeout was raised 120→300s earlier because 12MB PDFs take ~2 min just to upload on slow connections.
+- `wrangler.jsonc` — Cloudflare Workers config (added 2026-05-13). `"assets": { "directory": "." }` serves files from repo root. Cloudflare auto-deploys on push to `main`.
 - `requirements.txt`, `.env.example`, `.gitignore`, `SYSTEM_PROMPT.md`
 
 `learning copy.py` is a legacy duplicate; the active module is `learning.py`.
@@ -85,6 +88,8 @@ Currently wide-open: `CORS(app, origins='*', ...)` and `@app.after_request` adds
 
 Render's edge error pages (e.g., 502, 500 from Gunicorn timeout) are served WITHOUT CORS headers because Flask never gets a chance to run `@app.after_request`. The fix is preventing the timeout, not the CORS config.
 
+When locking CORS down, allow BOTH `https://martinezwesternaitakeoff.com` and `https://www.martinezwesternaitakeoff.com` (both are attached to the Cloudflare Worker as custom domains).
+
 ## Known operational gotchas
 
 - **Render free-tier cold start:** 15 min idle → service sleeps → next request takes 30-60s to wake. Browser users see hangs or "Failed to fetch." If this becomes a problem, either set up a keep-warm cron (ping `/api/health` every 14 min) or upgrade to the $7/mo plan.
@@ -119,7 +124,7 @@ Track of items raised but not yet implemented:
   - `CLAUDE_MODEL` — defaults to `claude-sonnet-4-6` (latest Sonnet generation)
   - `WASTE_FACTOR` — optional; defaults to `1.05`
   - `LESSONS_FILE` — optional override of `/data/lessons.jsonl`
-- **Health endpoint:** `/api/health` returns `{ok, model, api_key_loaded, skill_loaded, skill_chars}`. Use `skill_chars` to verify SKILL.md updates landed after a deploy.
+- **Health endpoint:** `/api/health` returns `{ok, model, api_key_loaded, skill_loaded, skill_chars, pdf_engine, pdf_engine_loaded, pdf_engine_version, pdf_engine_error}`. Use `skill_chars` to verify SKILL.md updates landed after a deploy, and `pdf_engine_loaded` to verify pypdfium2's C binding is healthy.
 
 ## Things Claude (the assistant) cannot do for the user
 
@@ -132,6 +137,11 @@ Track of items raised but not yet implemented:
 ## Conversation history
 
 - **May 1, 2026** — Initial Render deployment setup. Blueprint linked, first deploy.
+- **May 13, 2026** — Memory fixes + frontend host migration:
+  - Render OOM'd on a large drawing render. Root cause: PyPDF2 loaded the entire PDF binary + all parsed images into RAM, then 2 Gunicorn workers doubled peak under concurrency on a 512MB Starter instance. Fix: swapped PyPDF2 → pypdfium2 with explicit per-page close(), dropped workers 2→1 with 4 threads, added `gc.collect()` after each upload, added pypdfium2 health probe at `/api/health`. User then upgraded Render instance plan separately.
+  - Netlify exceeded free-tier credit limit — 21 GitHub deploys consumed 315 of 300 free credits (15 credits per deploy). Web traffic itself was ~3 credits, basically free. Diagnosis: Netlify's pricing is calibrated for low deploy frequency; the workflow of pushing per commit blew the budget.
+  - Migrated frontend from Netlify → Cloudflare Workers (with Static Assets). Cloudflare auto-opened a config PR (`wrangler.jsonc`); merged. Added `martinezwesternaitakeoff.com` as a Cloudflare DNS zone (free plan), changed Namecheap nameservers to `lisa/titan.ns.cloudflare.com`, deleted Netlify-pointing A/CNAME records, attached apex + www to the Worker as Custom Domains. Email forwarding MX + SPF preserved. Deleted Netlify site. End state: zero credit anxiety on the frontend, 500 free builds/mo on Cloudflare, free DDoS + global CDN.
+  - GitHub repo renamed `Dmarrt27/Claudev2` → `Dmarrt27/ai-takeoff` somewhere in this process; auto-redirects work but local clones should `git remote set-url` to the new name.
 - **May 11–12, 2026** — Major reconciliation:
   - Set up local `gh` CLI + cloned repo to `~/Projects/ai-takeoff` (user had no clone before; was using GitHub web UI uploads)
   - Pushed accumulated local changes (newer `app.py`, `learning.py`, new `concrete-takeoff/SKILL.md`, `.gitignore`, etc.)
