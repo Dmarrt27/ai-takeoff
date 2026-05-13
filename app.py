@@ -4,6 +4,7 @@ Flask backend for PDF-based quantity takeoff
 """
 
 import os
+import gc
 import json
 import re
 import hashlib
@@ -14,7 +15,7 @@ import base64
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-import PyPDF2
+import pypdfium2 as pdfium
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from learning import format_lessons_for_prompt, trigger_lesson_extraction, load_lessons
@@ -88,17 +89,46 @@ def load_concrete_takeoff_skill():
 SKILL_PROMPT = load_concrete_takeoff_skill()
 
 
+# Probe pypdfium2 at boot so a broken wheel surfaces in /api/health instead of
+# blowing up on the first upload. We create an empty in-memory document, which
+# exercises the C-library binding (not just the Python wrapper import).
+try:
+    _probe = pdfium.PdfDocument.new()
+    _probe.close()
+    PDF_ENGINE_OK = True
+    PDF_ENGINE_ERROR = None
+except Exception as _e:
+    PDF_ENGINE_OK = False
+    PDF_ENGINE_ERROR = f"{type(_e).__name__}: {_e}"
+PDF_ENGINE_VERSION = str(getattr(pdfium, 'V_PYPDFIUM2', 'unknown'))
+
+
 def extract_pdf_text(pdf_path):
-    """Extract all text from a PDF, page by page."""
+    """Extract text from a PDF page-by-page, releasing each page after use.
+
+    Uses pypdfium2 (Google's PDFium C library) which streams pages on demand
+    and exposes explicit close() calls. For large image-heavy drawing PDFs
+    this keeps peak memory bounded to one page at a time instead of the
+    whole document, which is what PyPDF2 was doing.
+    """
     text_parts = []
-    with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
-        for i, page in enumerate(reader.pages):
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for i in range(len(pdf)):
+            page = pdf[i]
             try:
-                page_text = page.extract_text() or ""
-            except Exception as e:
-                page_text = f"[Error extracting page {i+1}: {e}]"
+                tp = page.get_textpage()
+                try:
+                    page_text = tp.get_text_range() or ""
+                except Exception as e:
+                    page_text = f"[Error extracting page {i+1}: {e}]"
+                finally:
+                    tp.close()
+            finally:
+                page.close()
             text_parts.append(f"\n--- PAGE {i+1} ---\n{page_text}")
+    finally:
+        pdf.close()
     return "".join(text_parts)
 
 
@@ -402,6 +432,10 @@ def health():
         "api_key_loaded": client is not None,
         "skill_loaded": bool(SKILL_PROMPT),
         "skill_chars": len(SKILL_PROMPT),
+        "pdf_engine": "pypdfium2",
+        "pdf_engine_loaded": PDF_ENGINE_OK,
+        "pdf_engine_version": PDF_ENGINE_VERSION,
+        "pdf_engine_error": PDF_ENGINE_ERROR,
     })
 
 
@@ -490,6 +524,9 @@ def upload_file():
                 os.remove(save_path)
             except OSError:
                 pass
+            # Release PDF parse buffers and conversation history back to the
+            # OS so the next request starts fresh instead of inheriting peak.
+            gc.collect()
 
         return jsonify({
             'success': True,
