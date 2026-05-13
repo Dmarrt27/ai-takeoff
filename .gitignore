@@ -37,3 +37,9 @@ takeoff_feedback_*.json
 
 # Backup files
 *.bak
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+!.env.example
