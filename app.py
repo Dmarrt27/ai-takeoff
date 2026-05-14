@@ -5,12 +5,15 @@ Flask backend for PDF-based quantity takeoff
 
 import os
 import gc
+import io
 import json
 import re
 import hashlib
 import traceback
 import threading
 import base64
+
+from PIL import Image
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -63,6 +66,12 @@ MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 # good coverage of a 25-30 page set without blowing the context window.
 MAX_PDF_CHARS = 40000
 
+# Pages with fewer than this many characters are assumed to be vector/raster
+# drawings with no machine-readable text; they are rendered to images for vision.
+VISION_TEXT_THRESHOLD = 100
+# Maximum pages to render — limits memory and per-request vision token cost.
+MAX_VISION_PAGES = 10
+
 # Path to the bundled concrete-takeoff skill. The skill encodes the full
 # professional workflow (ingest → extract → calculate → group → output) and
 # is injected as the system prompt so every analysis follows it.
@@ -110,8 +119,13 @@ def extract_pdf_text(pdf_path):
     and exposes explicit close() calls. For large image-heavy drawing PDFs
     this keeps peak memory bounded to one page at a time instead of the
     whole document, which is what PyPDF2 was doing.
+
+    Returns (full_text, sparse_page_indices) where sparse_page_indices are
+    0-based page numbers whose text yield fell below VISION_TEXT_THRESHOLD —
+    candidates for vision-based rendering.
     """
     text_parts = []
+    sparse_pages = []
     pdf = pdfium.PdfDocument(pdf_path)
     try:
         for i in range(len(pdf)):
@@ -127,9 +141,49 @@ def extract_pdf_text(pdf_path):
             finally:
                 page.close()
             text_parts.append(f"\n--- PAGE {i+1} ---\n{page_text}")
+            if len(page_text.strip()) < VISION_TEXT_THRESHOLD:
+                sparse_pages.append(i)
     finally:
         pdf.close()
-    return "".join(text_parts)
+    return "".join(text_parts), sparse_pages
+
+
+def render_pages_as_images(pdf_path, page_indices):
+    """Render sparse PDF pages to JPEG images for Claude vision.
+
+    Pages are rendered at 2x scale (144 DPI) then resized to fit within
+    1568px — Claude's optimal input size. Returns a list of dicts with
+    page number, base64-encoded JPEG data, and media_type.
+    """
+    images = []
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for i in page_indices[:MAX_VISION_PAGES]:
+            page = pdf[i]
+            try:
+                bitmap = page.render(scale=2.0)
+                try:
+                    pil_img = bitmap.to_pil()
+                    w, h = pil_img.size
+                    if max(w, h) > 1568:
+                        ratio = 1568 / max(w, h)
+                        pil_img = pil_img.resize(
+                            (int(w * ratio), int(h * ratio)), Image.LANCZOS
+                        )
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format='JPEG', quality=85)
+                    images.append({
+                        'page': i + 1,
+                        'data': base64.b64encode(buf.getvalue()).decode('utf-8'),
+                        'media_type': 'image/jpeg',
+                    })
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+    finally:
+        pdf.close()
+    return images
 
 
 def _parse_json_block(text):
@@ -260,25 +314,31 @@ def _verify_element_volumes(elements, waste_factor=WASTE_FACTOR):
     return audit
 
 
-def extract_quantities_with_claude(pdf_text, filename):
-    """Two-turn conversation: identify elements, then compute volumes."""
+def extract_quantities_with_claude(pdf_text, page_images, filename):
+    """Two-turn conversation: identify elements, then compute volumes.
+
+    page_images is a list of {page, data, media_type} dicts rendered from
+    sparse pages. When present they are attached to Turn 1 so Claude can
+    read dimension callouts directly from the vector/raster drawing layers.
+    """
     if client is None:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Create a .env file with "
             "ANTHROPIC_API_KEY=sk-ant-... or export it in your shell."
         )
 
-    if not pdf_text.strip() or len(pdf_text.strip()) < 50:
-        # Likely a scanned/image-only PDF — PyPDF2 cannot OCR.
+    has_text = pdf_text.strip() and len(pdf_text.strip()) >= 50
+    has_images = bool(page_images)
+
+    if not has_text and not has_images:
         return {
             "elements": [],
             "summary": {
                 "total_cubic_yards": 0,
                 "assumptions": [
-                    "PDF appears to be scanned/image-based; no text could be extracted.",
-                    "OCR is required to process this drawing.",
+                    "PDF appears to be scanned/image-based with no extractable text or renderable pages.",
                 ],
-                "status": "no_text_extracted",
+                "status": "no_content_extracted",
             },
         }
 
@@ -329,7 +389,27 @@ Follow Step 1 (Ingest and Orient) and Step 2 (Extract Dimensions) of the concret
 - For sloped elements: starting height, ending height, slope percentage, and the wedge formula used
 
 If a dimension is not stated, use a reasonable construction default and note it. Respond with prose first, then a JSON list."""
-    history.append({"role": "user", "content": initial})
+    # Build Turn 1 content: text prompt always present; attach rendered page
+    # images when available so Claude can read dimension callouts directly.
+    if page_images:
+        turn1_content = [{"type": "text", "text": initial}]
+        for img in page_images:
+            turn1_content.append({
+                "type": "text",
+                "text": f"\nRendered drawing — page {img['page']}:",
+            })
+            turn1_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img['media_type'],
+                    "data": img['data'],
+                },
+            })
+    else:
+        turn1_content = initial
+
+    history.append({"role": "user", "content": turn1_content})
 
     resp = client.messages.create(
         model=MODEL,
@@ -517,8 +597,9 @@ def upload_file():
         f.save(save_path)
 
         try:
-            pdf_text = extract_pdf_text(save_path)
-            result = extract_quantities_with_claude(pdf_text, filename)
+            pdf_text, sparse_pages = extract_pdf_text(save_path)
+            page_images = render_pages_as_images(save_path, sparse_pages) if sparse_pages else []
+            result = extract_quantities_with_claude(pdf_text, page_images, filename)
         finally:
             try:
                 os.remove(save_path)
@@ -532,6 +613,7 @@ def upload_file():
             'success': True,
             'filename': filename,
             'pages_text_chars': len(pdf_text),
+            'vision_pages_rendered': len(page_images),
             'data': result,
         })
     except Exception as e:
