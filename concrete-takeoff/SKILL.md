@@ -30,7 +30,7 @@ When the user provides drawings (PDF or image):
 
 ### Step 1.5 — Drawing Review Sequence (Martinez Western Workflow)
 
-This is the canonical sheet-review order used by Martinez Western Constructors. Walk through these sheets in this order BEFORE extracting dimensions — each pass surfaces information later passes depend on. **Every cross-section detail referenced from a plan view must be opened and read** — section details routinely contain dimensions that the plan view itself does not show.
+This is the canonical sheet-review order used by Martinez Western Constructors. Walk through these sheets in this order BEFORE extracting dimensions — each pass surfaces information later passes depend on. **Every cross-section detail referenced from a plan view must be opened and read** — section details routinely contain dimensions that the plan view itself does not show. The mechanics for spotting a cross-section callout, navigating to the referenced sheet, and pairing section dimensions with plan dimensions are formalized in **Step 1.7 — Cross-Section Callout Navigation Protocol**.
 
 #### A. Cover Sheet
 - Review 3D renderings if present
@@ -104,6 +104,105 @@ Repeat the foundation-level passes for every subsequent level. Additional consid
 - **Steps in structural slabs**: identify and count separately
 - **Slabs on metal deck (composite)**: measure deck plan area and topping thickness; no shoring line
 
+### Step 1.7 — Cross-Section Callout Navigation Protocol (Mandatory)
+
+Cross-section callouts are the mechanism by which a plan view tells you "the complete detail for this cut lives on another sheet." You must learn to recognize them on sight, navigate to the referenced sheet to read the section, then return to the plan to pair dimensions. **The plan view alone never contains enough information to compute concrete volume** — plan shows length and width in plan; cross-section shows heights, depths, thicknesses, embedments, layers, and reinforcement. Both are required for every element.
+
+#### A. Recognizing a cross-section callout on a plan or elevation
+
+A cross-section callout appears as:
+- A **circle (or diamond) divided into two halves** by a horizontal line
+- The **top half** carries a letter or number identifier — `A`, `B`, `C`, `1`, `2`, …
+- The **bottom half** carries the sheet reference where the section is drawn — typically a structural sheet such as `S5`, `S6`
+- A **triangular arrow / flag** attached to the circle points in the direction the cut is "looking" (which side of the cutting plane the section view faces)
+- A short tick or filled rectangle marks the **cutting-plane location** — the exact line along the plan where the section is sliced
+- Often a `TYP` note nearby — meaning the same cross-section applies at every similar condition
+
+Common forms you will see:
+| Marker | Reads as |
+|---|---|
+| `A / S5` | "Section A is drawn on Sheet S5" |
+| `B / S5  TYP` | "Section B (typical condition) is drawn on Sheet S5" |
+| `1 / S6` | "Detail 1 is drawn on Sheet S6" |
+| `3 / A4.1` | Detail callouts can also reference architectural sheets |
+
+Two marker arrows pointing at each other across a structure indicate the **start and end of a cutting plane line** — both arrows reference the same section.
+
+#### B. Navigation workflow — what to do every time you spot a callout
+
+1. **On the plan view**, record before navigating away:
+   - Callout ID (e.g., `B / S5`)
+   - Which structural element the cut passes through (footing, wall, slab, beam)
+   - Direction the arrow faces (orients the section view)
+   - All **plan-view dimensions** along and across the cut line — these are the L / W you will multiply by the section's depths
+
+2. **Navigate to the referenced sheet** (e.g., Sheet S5)
+   - Locate the section drawing labeled with the matching identifier (e.g., `SECTION B`)
+   - Confirm the marker letter inside its title bubble matches the callout you came from
+
+3. **On the section drawing, extract every dimension visible**:
+   - Vertical heights — wall H, footing depth, slab T
+   - Top-of-wall and bottom-of-footing elevations
+   - Layer thicknesses — slab on grade, topping, waterstop, starter wall
+   - Steps, keys, dowels, batter, taper
+   - Reinforcement size and spacing, mat positions (TOP / BTM, EF / IF, EW)
+   - Clear-cover dimensions (affects no volume but flags rebar placement)
+
+4. **Return to the original plan view** carrying the section's dimensions
+   - Pair `plan length × plan width × section depth/thickness` in the volume formula
+   - Use section height for walls, section depth for footings, section thickness for slabs
+   - Pair the section's rebar callouts (spacing, size) with plan length to compute LF of bar
+
+5. **If the section is marked `TYP`**, the section dimensions apply at every visually identical condition on the plan. Do not re-navigate for each, BUT verify each location actually matches — corner conditions, terminations, step locations, and openings are usually NOT typical and have their own callouts.
+
+#### C. Which dimension lives in which view
+
+| Dimension | Read from | Notes |
+|---|---|---|
+| Length of footing/wall along structure | Plan view | Measured between plan dimension lines |
+| Footprint width in plan | Plan view | Confirm against section if both shown |
+| Wall thickness | **Cross-section** | Plan often shows centerline only |
+| Footing depth / slab thickness | **Cross-section** | Never shown on plan |
+| Wall height (top-of-footing → top-of-wall) | **Cross-section** + A-sheet elevations | Cross-check with finished-floor elevations |
+| Footing-to-wall key / dowel detail | **Cross-section** | Affects rebar takeoff, sometimes adds a small CY for the key |
+| Reinforcement size & spacing | **Cross-section** | Plan rarely shows bar callouts directly |
+| Top-of-wall variation | Plan callout + cross-section | Plan calls TOW elevation; section confirms height build-up |
+| Step locations along a footing | Plan view | Section shows what each step looks like; plan shows where it occurs |
+| Count of elements | Plan view | Number of footings, columns, walls |
+| Waterstop / blockout details | **Cross-section** | Affects layout and embeds, not usually CY |
+
+#### D. The mental model
+
+Every cast-in-place concrete element is a **3D solid**. The plan view shows its footprint in the X-Y plane; the cross-section shows its profile in the X-Z (or Y-Z) plane. Volume requires all three axes — so until both views have been read, the element does not have enough data for volume math. **Never start CY calculations on an element whose cross-section has not been opened and read.** If a callout points to a sheet that is missing from the set, flag it and stop the takeoff for that element rather than guessing depths from typical values.
+
+#### E. Example — typical retaining-wall callout pair
+
+Plan view (Sheet S2, Foundation Plan) shows a continuous wall footing with callout `B / S5 TYP` pointing perpendicular to the wall. Plan dimensions give a wall run of 64'-0".
+
+Navigate to Sheet S5, find `SECTION B`. Read:
+- Footing depth: **1'-6"**; footing extends 3'-3" one side and 8'-6" the other from wall centerline
+- Wall height (top of footing → top of wall): **10'-8"**
+- Wall thickness: **1'-8"**, with 2" clear cover
+- Wall reinforcement: #6 at 7" O.C. vertical EF, #6 at 7" O.C. horizontal EF
+- Footing top mat: #6 at 8" O.C. EW; bottom mat: #6 at 5" O.C. EW
+- Dowels from footing to wall: #6 at 7" O.C. EF
+- Hydrophilic waterstop at top of wall (no CY impact, note for embeds)
+
+Return to S2 and compute, pairing plan length with section dimensions:
+
+```
+Wall CY:      64' × 10.667' × 1.667' ÷ 27   = 42.16 CY
+Footing CY:   64' × (3.25' + 1.667' + 8.5') × 1.5' ÷ 27   (footing width built up from section)
+```
+
+Because the callout is `TYP`, reuse these section dimensions for every visually identical wall on the foundation plan — but re-measure plan length for each run, and look for corner / step callouts that override the typical.
+
+#### F. Adjacent sections on the same sheet
+
+When a referenced sheet (e.g., S5) holds multiple sections (e.g., Section A and Section B on the same page), read **both** before leaving:
+- Adjacent sections often share dimensions with one shown on Section A and another on Section B (e.g., the perpendicular interior chamber width may only be dimensioned on Section A, while Section B labels everything else). This is the same cross-referencing pattern formalized in Step 2.6.
+- Note any geometric differences between the sections — different wall heights, different reinforcement, different footing widths — these signal that the structure changes condition between the two cut locations.
+
 ### Step 2 — Extract Dimensions
 
 For each element, extract or derive:
@@ -174,7 +273,7 @@ Examples of the two most common derivations on civil/industrial work:
 | Slope run when slab doesn't cover full span | `run = interior_span - sump_width - step_offsets` |
 | Perpendicular plan dim missing from this section | Read from plan view (Section A) or opposite section on same sheet |
 
-Cross-reference rule: when a dimension is missing on Section B, **look at Section A and any plan/key views on the same sheet number before scaling**. Scaling is the last resort and must be flagged as `confidence: low`.
+Cross-reference rule: when a dimension is missing on Section B, **look at Section A and any plan/key views on the same sheet number before scaling**. Scaling is the last resort and must be flagged as `confidence: low`. The full callout-to-section-and-back navigation flow is documented in Step 1.7; this step focuses on what to do once you are reading the section and need a dimension the section omits.
 
 A reusable Python helper for these computations is bundled at:
 `concrete-takeoff/scripts/trapezoidal_volume.py` — see the `_example_wet_well_sloped_floor()` block for a fully worked derivation chain that produces 138 CY on the City of Rifle wet well floor.
@@ -318,6 +417,10 @@ Before presenting output, verify:
 - [ ] All building sections and wall sections reviewed
 - [ ] Stair/elevator sections reviewed (if present)
 - [ ] **Every cross-section detail referenced from a plan view has been opened and read**
+- [ ] For each callout: marker ID, sheet reference, cut location, and arrow direction were recorded on the plan before navigating away (Step 1.7)
+- [ ] No element has volume math run until both its plan view AND its referenced cross-section have been read
+- [ ] `TYP` callouts verified at every location (corners, terminations, steps re-checked for non-typical conditions)
+- [ ] When a referenced sheet holds multiple sections (e.g., Section A and Section B on S5), both were read for cross-referenced dimensions
 - [ ] Structural general notes captured (concrete mix specs, rebar laps and development)
 - [ ] Footing schedule cross-referenced with the foundation plan
 
