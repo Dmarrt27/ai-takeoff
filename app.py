@@ -413,11 +413,12 @@ If a dimension is not stated, use a reasonable construction default and note it.
 
     resp = client.messages.create(
         model=MODEL,
-        max_tokens=2500,
+        max_tokens=6000,
         system=system_prompt,
         messages=history,
     )
-    prose_response = resp.content[0].text
+    # Join every text block so multi-block responses aren't truncated.
+    prose_response = "".join(getattr(b, "text", "") for b in resp.content)
     history.append({"role": "assistant", "content": prose_response})
 
     calc = """Now perform Step 3 (Calculate Quantities) of the concrete-takeoff skill and compute the concrete volume for each element. Apply a 5% waste/overbreak factor unless drawings specify otherwise, and run the Quality Checks before calling the return_takeoff tool.
@@ -452,6 +453,50 @@ Call the return_takeoff tool with all elements and the summary totals."""
         # Should never happen with forced tool_choice, but keep a text fallback
         raw = "".join(getattr(b, "text", "") for b in resp.content)
         parsed = _parse_json_block(raw)
+
+    # Re-prompt Claude when the forced tool call came back with elements=[]
+    # but the Turn 1 prose clearly identified concrete elements. Without this,
+    # the response leaks back to the frontend as narrative text and the UI
+    # shows the "AI returned narrative analysis" fallback instead of a table.
+    MAX_TOOL_RETRIES = 2
+    for _ in range(MAX_TOOL_RETRIES):
+        if not tool_block:
+            break
+        if (parsed or {}).get("elements"):
+            break
+        if len((prose_response or "").strip()) < 100:
+            break
+        history.append({"role": "assistant", "content": resp.content})
+        history.append({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_block.id,
+                "is_error": True,
+                "content": (
+                    "Your return_takeoff call had elements=[] but your earlier "
+                    "analysis identified concrete elements. Call return_takeoff "
+                    "again and populate elements with EVERY concrete element "
+                    "from that analysis. For each: name (e.g. 'Foundation Slab', "
+                    "'Column Footing F1'), width_ft, length_ft, depth_ft, qty, "
+                    "cubic_feet (= width × length × depth × qty), cubic_yards "
+                    "(= cubic_feet / 27), notes. Also fill summary.total_cubic_yards, "
+                    "summary.total_cubic_feet, and summary.assumptions. Do not "
+                    "return an empty elements list."
+                ),
+            }],
+        })
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=4000,
+            system=system_prompt,
+            messages=history,
+            tools=[_TAKEOFF_TOOL],
+            tool_choice={"type": "tool", "name": "return_takeoff"},
+        )
+        tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
+        if tool_block:
+            parsed = tool_block.input
 
     if parsed:
         # Deterministic Python recompute of every element's volume from the
