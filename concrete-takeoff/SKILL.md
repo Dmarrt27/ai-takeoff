@@ -28,6 +28,82 @@ When the user provides drawings (PDF or image):
 3. List the structural elements visible that contain concrete (footings, slabs, walls, columns, beams, piers, caissons)
 4. Confirm your understanding with a brief one-paragraph summary before calculating
 
+### Step 1.5 — Drawing Review Sequence (Martinez Western Workflow)
+
+This is the canonical sheet-review order used by Martinez Western Constructors. Walk through these sheets in this order BEFORE extracting dimensions — each pass surfaces information later passes depend on. **Every cross-section detail referenced from a plan view must be opened and read** — section details routinely contain dimensions that the plan view itself does not show.
+
+#### A. Cover Sheet
+- Review 3D renderings if present
+- Count and note: number of floors, balconies, overhangs, parking levels, patios, decks
+- Capture anything you want to be sure to find later
+
+#### B. Drawing Index
+- Verify completeness — no gaps in sheet numbering, all referenced sheets present
+- Flag gaps before proceeding
+
+#### C. Architectural Drawings
+- Read **all four exterior elevations**
+- Note floors, decks, patios, floor types per level
+- These sheets carry the **finished floor elevations**
+
+#### D. Building Sections & Wall Sections
+Cross sections will typically show:
+- Footings (continuous and pad)
+- Walls (with top-of-wall heights)
+- Slab on grade
+- Slab on metal deck
+- Structural or post-tensioned suspended slabs
+- Concrete floors over wood-framed assemblies
+
+#### E. Stair & Elevator Section Plans
+If present, these provide concrete floor types and dimensions for stair landings and elevator pits/shafts.
+
+#### F. Structural Plans (S-sheets)
+This is where the dimensioned concrete information lives. Process in this order:
+1. **General notes** — concrete mix required at various components, reinforcing lap and development lengths
+2. **Footing schedule** — dimensions for each footing type, keyed to the identifier shown on the foundation plan
+3. **Foundation plan** — start the takeoff here (footings are placed first in construction sequence)
+
+> **For concrete quantities, almost all important dimensions live on S-sheets.** Always cross-check against A-sheet elevations and details before calculating (see Step 2 — Extract Dimensions).
+
+### Step 1.6 — Takeoff Order (Construction Sequence)
+
+Take off elements in the order they will be built, level by level. This catches step-change interactions — e.g. a step in a continuous footing changes the height of the wall above it — that are routinely missed when working strictly by element type.
+
+#### Foundation level — process in this exact order
+
+1. **Continuous footings** — dimension length, width, depth by type
+   - Outputs: SF formed surface, SF finished surface, neat CY of concrete
+   - **Identify every step** in the continuous footing — each step is extra forming, extra concrete, AND a change in wall height above
+
+2. **Footing pads / isolated footings** — dimension length, width, depth, and total pad count
+   - Outputs: SF formed surface, SF finished surface, neat CY of concrete
+   - Note foundations requiring columns and/or anchor bolts
+
+3. **Walls** — measure continuously where height and width are constant
+   - Wall height breaks at: footing steps, top-of-wall changes, floor-type changes above
+   - Top of wall is usually called out on the foundation sheet; if not, the wall extends to the next level
+   - Walls spanning multiple levels: if continuous through the upper level → measure full height; if it terminates and a new wall starts on the slab above → measure each segment separately
+   - **Doors, windows, blockouts measured separately** so concrete CY can be deducted — BUT measure the wall to its full height so forming includes the two sides of each opening
+   - Outputs: total SF of forming (openings included in forming), total CY before deducting blockout volume, blockout deduction CY
+   - If structural steel is present, count embed plates that bolt to or embed in the wall
+
+4. **Concrete columns** — count and dimension (height, width / diameter) for forming SF and CY
+
+5. **Interior slab on grade** (less any blockouts)
+   - Separate different concrete sections (different mix, thickness, or finish)
+   - Measure SF and thickness
+   - Measure perimeters and any locations where a wall-expansion or thickened-edge detail is shown
+   - Identify and measure **sumps and floor trench drains** as their own line items
+
+#### Upper levels (Level 1, 2, 3, …)
+
+Repeat the foundation-level passes for every subsequent level. Additional considerations:
+
+- **Cast-in-place structural floor**: requires shoring — list shoring quantities separately from slabs placed on metal deck
+- **Steps in structural slabs**: identify and count separately
+- **Slabs on metal deck (composite)**: measure deck plan area and topping thickness; no shoring line
+
 ### Step 2 — Extract Dimensions
 
 For each element, extract or derive:
@@ -234,6 +310,28 @@ Apply these defaults unless the user specifies otherwise:
 ## Quality Checks
 
 Before presenting output, verify:
+
+**Drawing review (Step 1.5):**
+- [ ] Cover sheet reviewed; floor count and exterior features (balconies, overhangs, parking, patios, decks) captured
+- [ ] Drawing index reviewed for completeness — no missing sheet numbers
+- [ ] All four architectural exterior elevations reviewed; finished floor elevations captured
+- [ ] All building sections and wall sections reviewed
+- [ ] Stair/elevator sections reviewed (if present)
+- [ ] **Every cross-section detail referenced from a plan view has been opened and read**
+- [ ] Structural general notes captured (concrete mix specs, rebar laps and development)
+- [ ] Footing schedule cross-referenced with the foundation plan
+
+**Construction-sequence takeoff (Step 1.6):**
+- [ ] Continuous footings separated from isolated pad footings
+- [ ] Every step in continuous footings counted; wall-height changes propagated above
+- [ ] Walls measured continuously between height/width changes only
+- [ ] Wall openings (doors/windows/blockouts) measured as separate deductions; forming SF still includes the opening sides
+- [ ] Embed plates counted on walls that touch structural steel
+- [ ] Sumps and trench drains measured as separate SOG line items
+- [ ] Each level processed in construction sequence (footings → walls → columns → SOG → sumps)
+- [ ] Cast-in-place structural decks (require shoring) distinguished from composite metal-deck slabs (no shoring)
+
+**Geometry & math:**
 - [ ] Every element has an explicit geometry classification (Step 2.5) — no element silently treated as rectangular
 - [ ] Any element with a `% SLOPE` annotation, "TYP" thickness paired with a sloping face, or two different end thicknesses is classified as `TRAPEZOIDAL_PRISM` and computed with `0.5 × (d_min + d_max) × L × W`
 - [ ] Every implied dimension has a 4-line derivation block (label / needed-for / source / derivation arithmetic)
