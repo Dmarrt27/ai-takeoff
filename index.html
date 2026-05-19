@@ -739,6 +739,154 @@
         }
         .results-empty-title { font-family: var(--font-display); font-size: 20px; font-weight: 700; color: var(--fg2); margin-bottom: 8px; }
         .results-empty-hint { font-family: var(--font-body); font-size: 13px; color: var(--fg3); margin-bottom: 20px; }
+
+        /* ── Mobile responsive ─────────────────────────────
+           Keep desktop/laptop layout untouched. These rules
+           only kick in on narrow viewports (tablets in
+           portrait and phones) so the header, upload card,
+           how-it-works grid, summary card, diff columns,
+           and action buttons stop overlapping. */
+        @media (max-width: 768px) {
+            /* Header — let it wrap, shrink padding & logo */
+            .app-header {
+                padding: 12px 16px;
+                height: auto;
+                min-height: 72px;
+                gap: 12px;
+                flex-wrap: wrap;
+            }
+            .logo-wrap { gap: 12px; min-width: 0; }
+            .logo-img { height: 44px; }
+            .header-product { padding-left: 12px; gap: 3px; min-width: 0; }
+            .header-product-eyebrow { font-size: 9px; letter-spacing: 0.14em; }
+            .header-product-title { font-size: 13px; }
+            .header-right { gap: 10px; flex-shrink: 0; }
+            .header-status { font-size: 11px; }
+
+            /* Sub-nav — allow horizontal scroll if cramped */
+            .app-subnav {
+                padding: 0 16px;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: none;
+            }
+            .app-subnav::-webkit-scrollbar { display: none; }
+            .subnav-btn { padding: 0 14px; font-size: 12px; }
+
+            /* Page wrapper */
+            .page-wrap { padding: 28px 16px 48px; }
+
+            /* Page intro */
+            .page-intro { margin-bottom: 24px; }
+            .page-intro h1 { font-size: 28px; }
+            .page-intro p { font-size: 14px; }
+            .page-intro-eyebrow::after { max-width: 60px; }
+
+            /* Upload section — stack vertically (overrides inline styles) */
+            .upload-section {
+                flex-direction: column !important;
+                align-items: stretch !important;
+                text-align: center !important;
+                padding: 22px 20px !important;
+                gap: 14px !important;
+            }
+            .upload-section .upload-icon-wrap { margin: 0 auto !important; }
+            .upload-section .btn-row {
+                width: 100%;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .upload-section .btn-row .upload-button,
+            .upload-section .btn-row .demo-button {
+                flex: 1 1 auto;
+                min-width: 130px;
+                padding: 11px 14px;
+            }
+
+            /* How it works — single column */
+            .how-it-works { grid-template-columns: 1fr; gap: 12px; }
+            .how-card { padding: 18px 20px; }
+
+            /* Results topbar */
+            .results-topbar { gap: 12px; }
+            .results-topbar > div:first-child { flex: 1 1 100%; }
+            .results-topbar-title { font-size: 20px; }
+            .topbar-actions { width: 100%; flex-wrap: wrap; }
+            .topbar-actions .btn { flex: 1 1 auto; justify-content: center; }
+
+            /* Summary card — stack & shrink huge number */
+            .summary-card {
+                grid-template-columns: 1fr;
+                padding: 24px 22px;
+                gap: 14px;
+                text-align: center;
+            }
+            .summary-card-left { text-align: center; }
+            .summary-value { font-size: 48px; }
+            .summary-card-right { align-items: center; }
+
+            /* Rating row */
+            .rating-section {
+                flex-direction: column;
+                gap: 8px;
+                padding: 14px 16px;
+            }
+
+            /* Feedback notes */
+            .feedback-notes-section { padding: 16px 18px; }
+
+            /* Category breakdown */
+            .category-grid {
+                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+                gap: 8px;
+            }
+            .category-tile { padding: 10px 12px; }
+            .category-tile-value { font-size: 20px; }
+
+            /* Diff panel — stack columns */
+            .diff-panel { padding: 16px; }
+            .diff-columns { flex-direction: column; gap: 16px; }
+
+            /* Action buttons */
+            .action-buttons { gap: 8px; }
+            .action-buttons .btn { flex: 1 1 auto; justify-content: center; }
+
+            /* History cards */
+            .history-card { gap: 12px; padding: 14px 16px; }
+            .history-card-icon { width: 38px; height: 38px; border-radius: 8px; }
+            .history-card-name { font-size: 14px; }
+            .history-card-meta { font-size: 11px; }
+            .history-card-stat-val { font-size: 18px; }
+        }
+
+        @media (max-width: 480px) {
+            /* Very small phones — extra compaction */
+            .app-header { padding: 10px 14px; }
+            .logo-img { height: 38px; }
+            .header-product { padding-left: 10px; }
+            .header-product-title { font-size: 12px; }
+            .header-product-eyebrow { font-size: 8px; }
+            .header-status span:not(.header-status-dot) { display: none; }
+
+            .page-wrap { padding: 24px 14px 40px; }
+            .page-intro h1 { font-size: 24px; }
+            .page-intro p { font-size: 13px; }
+
+            .summary-card { padding: 20px 18px; }
+            .summary-value { font-size: 40px; }
+
+            .upload-section .btn-row .upload-button,
+            .upload-section .btn-row .demo-button {
+                min-width: 100%;
+            }
+
+            .results-topbar-title { font-size: 18px; }
+            .topbar-actions .btn {
+                font-size: 12px;
+                padding: 8px 12px;
+            }
+            .action-buttons .btn { font-size: 12px; padding: 10px 14px; }
+        }
     </style>
 </head>
 <body>
