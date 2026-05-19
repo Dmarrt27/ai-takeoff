@@ -213,6 +213,31 @@ def _parse_json_block(text):
     return None
 
 
+# Canonical concrete categories. Ordering mirrors SKILL.md Step 4 (construction
+# sequence) so the UI breakdown reads top-down as the work would be built.
+# "Non-Concrete" is a sink for anything Claude misidentifies (electrical
+# equipment, structural steel, etc.) — those rows are dropped before the
+# response leaves the backend.
+CONCRETE_CATEGORIES = [
+    "Footings",
+    "Walls",
+    "Slab on Grade",
+    "Suspended Slab",
+    "Columns",
+    "Beams",
+    "Piers / Caissons",
+    "Equipment Pads",
+    "Sidewalks / Curbs",
+    "Stairs / Landings",
+    "Sumps / Pits",
+    "Other Concrete",
+]
+# Anything tagged with one of these is non-concrete — filtered out before the
+# response is returned. Claude is told to only emit concrete in the prompt;
+# this is the safety net for when it slips and tags an electrical conduit or
+# steel beam as a concrete element anyway.
+NON_CONCRETE_CATEGORY = "Non-Concrete"
+
 # Tool definition that forces Claude to return structured takeoff data.
 # Using tool_choice={"type":"tool","name":"return_takeoff"} in the second
 # API call guarantees a ToolUseBlock response rather than prose text.
@@ -227,10 +252,32 @@ _TAKEOFF_TOOL = {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["name", "width_ft", "length_ft", "depth_ft",
-                                 "qty", "cubic_feet", "cubic_yards", "notes"],
+                    "required": ["name", "category", "width_ft", "length_ft",
+                                 "depth_ft", "qty", "cubic_feet", "cubic_yards",
+                                 "notes"],
                     "properties": {
                         "name":        {"type": "string"},
+                        "category": {
+                            "type": "string",
+                            "enum": CONCRETE_CATEGORIES + [NON_CONCRETE_CATEGORY],
+                            "description": (
+                                "Concrete element type. Use 'Footings' for "
+                                "continuous and isolated footings; 'Walls' for "
+                                "retaining/shear/foundation walls; 'Slab on "
+                                "Grade' for ground-bearing slabs; 'Suspended "
+                                "Slab' for slabs on metal deck or structural "
+                                "floors; 'Columns'; 'Beams'; 'Piers / "
+                                "Caissons'; 'Equipment Pads' for transformer "
+                                "pads, mechanical pads, light-pole bases, "
+                                "etc.; 'Sidewalks / Curbs' for exterior "
+                                "flatwork; 'Stairs / Landings'; 'Sumps / Pits' "
+                                "for sloped or recessed slabs; 'Other "
+                                "Concrete' for anything else that is concrete. "
+                                "Use 'Non-Concrete' ONLY if you mistakenly "
+                                "extracted electrical, plumbing, mechanical, "
+                                "or steel — those rows will be discarded."
+                            ),
+                        },
                         "width_ft":    {"type": "number"},
                         "length_ft":   {"type": "number"},
                         "depth_ft":    {"type": "number"},
@@ -262,13 +309,88 @@ WASTE_FACTOR = float(os.environ.get("WASTE_FACTOR", "1.05"))
 VOLUME_DRIFT_THRESHOLD = 0.01  # 1%
 
 
+# Keyword fallback used when Claude returns an element without a category
+# (older lessons, fallback prose parsing, or schema slip). Matches on name +
+# notes, longest/most-specific first.
+_CATEGORY_KEYWORDS = [
+    ("Sumps / Pits",       ["sump", "pit", "wet well", "trench drain"]),
+    ("Suspended Slab",     ["suspended slab", "slab on deck", "slab on metal deck",
+                            "metal deck", "structural slab", "elevated slab",
+                            "topping slab"]),
+    ("Stairs / Landings",  ["stair", "landing", "tread", "riser"]),
+    ("Sidewalks / Curbs",  ["sidewalk", "walkway", "curb", "gutter", "driveway",
+                            "apron", "flatwork"]),
+    ("Equipment Pads",     ["equipment pad", "transformer pad", "mechanical pad",
+                            "housekeeping pad", "pad ", "light pole base",
+                            "pole base"]),
+    ("Piers / Caissons",   ["pier", "caisson", "drilled shaft"]),
+    ("Beams",              ["beam", "grade beam", "tie beam"]),
+    ("Columns",            ["column"]),
+    ("Walls",              ["wall", "retaining", "shear wall", "stem wall"]),
+    ("Slab on Grade",      ["slab on grade", "sog", "foundation slab",
+                            "ground slab", "mat slab", "slab"]),
+    ("Footings",           ["footing", "footer", "foundation", "spread footing",
+                            "continuous footing"]),
+]
+
+# Heuristics for spotting a row Claude tagged as concrete but is obviously
+# not. These are the categories of "junk" we've seen leak through — electrical
+# gear, ductwork, conduits, structural steel, finishes. The filter is fired
+# even when the schema enum constrained the value, because Claude can still
+# stuff "Conduit" into the name field with a valid concrete category.
+_NON_CONCRETE_KEYWORDS = [
+    "electrical", "conduit", "wire", "cable tray", "luminaire", "lighting fixture",
+    "transformer (", "switchgear", "panelboard", "junction box",
+    "plumbing", "piping ", "pipe ", "valve", "hose bibb", "drain pipe",
+    "hvac", "ductwork", "duct ", "vav box", "ahu", "rtu",
+    "structural steel", "steel beam", "steel column", "steel joist", "w-flange",
+    "rebar only", "anchor bolt", "embed plate",
+    "drywall", "gypsum", "finish", "paint", "insulation", "membrane",
+    "asphalt", "soil", "aggregate", "gravel",
+    "wood ", "lumber", "framing",
+]
+
+
+def _classify_category(name, notes, current=None):
+    """Return a CONCRETE_CATEGORIES value for an element.
+
+    If `current` is already a valid concrete category we keep it. Otherwise
+    we fall back to keyword matching on name + notes. Last resort: 'Other
+    Concrete'.
+    """
+    if current and current in CONCRETE_CATEGORIES:
+        return current
+    haystack = f"{(name or '').lower()} {(notes or '').lower()}"
+    for category, keywords in _CATEGORY_KEYWORDS:
+        for kw in keywords:
+            if kw in haystack:
+                return category
+    return "Other Concrete"
+
+
+def _looks_non_concrete(el):
+    """Best-effort detection of rows that should be filtered as non-concrete.
+
+    Claude is told in the prompt to use the 'Non-Concrete' category for these,
+    but it sometimes hides them behind a valid concrete category (e.g. tags
+    'Electrical Conduit' as 'Other Concrete'). The keyword sweep catches both.
+    """
+    if (el.get("category") or "").strip().lower() == NON_CONCRETE_CATEGORY.lower():
+        return True
+    haystack = f"{(el.get('name') or '').lower()} {(el.get('notes') or '').lower()}"
+    return any(kw in haystack for kw in _NON_CONCRETE_KEYWORDS)
+
+
 def _verify_element_volumes(elements, waste_factor=WASTE_FACTOR):
     """Replace Claude's per-element cubic_feet / cubic_yards with values
-    computed from width × length × depth × qty in Python. Returns the audit
-    list so the response can surface every override that happened.
+    computed from width × length × depth × qty in Python. Also normalises
+    every element's `category` against CONCRETE_CATEGORIES so the frontend
+    can group by it without doing its own classification.
 
-    The geometric truth is w·l·d·qty in cubic feet. Claude's job is to
-    extract dimensions; arithmetic on those dimensions is Python's job.
+    Returns the audit list so the response can surface every override that
+    happened. The geometric truth is w·l·d·qty in cubic feet. Claude's job is
+    to extract dimensions and classify category; arithmetic on those
+    dimensions is Python's job.
     """
     audit = []
     for el in elements or []:
@@ -310,8 +432,60 @@ def _verify_element_volumes(elements, waste_factor=WASTE_FACTOR):
 
         el["cubic_feet"] = verified_cf
         el["cubic_yards"] = verified_cy
+        el["category"] = _classify_category(
+            el.get("name"), el.get("notes"), el.get("category")
+        )
 
     return audit
+
+
+def _filter_and_group_elements(elements):
+    """Drop non-concrete rows and compute per-category CY/CF subtotals.
+
+    Returns (kept_elements, dropped_elements, by_category). by_category is a
+    list of {category, cubic_yards, cubic_feet, element_count} in
+    CONCRETE_CATEGORIES order — categories with zero elements are omitted so
+    the UI can render the breakdown directly.
+    """
+    kept = []
+    dropped = []
+    for el in elements or []:
+        if _looks_non_concrete(el):
+            dropped.append({
+                "name": el.get("name", "(unnamed)"),
+                "category": el.get("category") or NON_CONCRETE_CATEGORY,
+                "reason": "Filtered as non-concrete (electrical, mechanical, "
+                          "plumbing, steel, or finishes)",
+            })
+            continue
+        kept.append(el)
+
+    subtotals = {c: {"cubic_yards": 0.0, "cubic_feet": 0.0, "element_count": 0}
+                 for c in CONCRETE_CATEGORIES}
+    for el in kept:
+        cat = el.get("category") or "Other Concrete"
+        if cat not in subtotals:
+            cat = "Other Concrete"
+            el["category"] = cat
+        try:
+            subtotals[cat]["cubic_yards"] += float(el.get("cubic_yards") or 0)
+            subtotals[cat]["cubic_feet"] += float(el.get("cubic_feet") or 0)
+        except (TypeError, ValueError):
+            pass
+        subtotals[cat]["element_count"] += 1
+
+    by_category = []
+    for cat in CONCRETE_CATEGORIES:
+        s = subtotals[cat]
+        if s["element_count"] == 0:
+            continue
+        by_category.append({
+            "category": cat,
+            "cubic_yards": round(s["cubic_yards"], 2),
+            "cubic_feet": round(s["cubic_feet"], 2),
+            "element_count": s["element_count"],
+        })
+    return kept, dropped, by_category
 
 
 def extract_quantities_with_claude(pdf_text, page_images, filename):
@@ -367,13 +541,19 @@ def extract_quantities_with_claude(pdf_text, page_images, filename):
         "You are a construction quantity takeoff specialist."
     )
 
+    categories_list = ", ".join(f'"{c}"' for c in CONCRETE_CATEGORIES)
     initial = f"""Analyzing a PDF of construction drawings: {filename}
 {lessons_section}
 CRITICAL RULES (validated from expert human corrections — follow exactly, in addition to the concrete-takeoff skill workflow):
-1. SLOPED / TAPERED SLAB VOLUMES: Any sump, pit, or base slab described with a percentage slope (e.g. "5% slope", "slopes to drain") is a wedge-shaped concrete element that must be computed as a SEPARATE, POSITIVE line item using: V = 0.5 × (h_start + h_end) × width × length ÷ 46656 (in³→yd³). h_end = h_start + (slope_pct/100) × length_in. Do NOT treat it as a simple deduction.
-2. MULTIPLE ROOF SLAB SECTIONS: If the roof slab plan or sections show different annotated thicknesses for different zones, extract EACH zone as its own element with its correct depth. Never apply one uniform thickness to the entire footprint when multiple depths are shown.
-3. INTERIOR WALL THICKNESS: Interior dividing walls are frequently thinner than perimeter walls. Always look for an explicit dimension callout on the interior wall — do NOT default to the perimeter wall thickness. If no callout exists, flag the row as uncertain.
-4. Cross check dimensions with other sheets to confirm the correct measurement before going to calculations.  
+1. CONCRETE ONLY — DO NOT include electrical, plumbing, mechanical, HVAC, structural steel, wood framing, drywall, finishes, or any non-concrete material as elements. Electrical conduits, conductors, transformers, panelboards, switchgear, light fixtures, ductwork, pipes, valves, steel beams/columns/joists, embed plates and anchor bolts (without their concrete encasement), wood members, insulation, and membranes are NOT concrete elements and must NOT appear in your output with a cubic-yard value. If a piece of equipment sits on a concrete pad, include ONLY the pad (category "Equipment Pads"), not the equipment.
+2. SLOPED / TAPERED SLAB VOLUMES: Any sump, pit, or base slab described with a percentage slope (e.g. "5% slope", "slopes to drain") is a wedge-shaped concrete element that must be computed as a SEPARATE, POSITIVE line item using: V = 0.5 × (h_start + h_end) × width × length ÷ 46656 (in³→yd³). h_end = h_start + (slope_pct/100) × length_in. Do NOT treat it as a simple deduction.
+3. MULTIPLE ROOF SLAB SECTIONS: If the roof slab plan or sections show different annotated thicknesses for different zones, extract EACH zone as its own element with its correct depth. Never apply one uniform thickness to the entire footprint when multiple depths are shown.
+4. INTERIOR WALL THICKNESS: Interior dividing walls are frequently thinner than perimeter walls. Always look for an explicit dimension callout on the interior wall — do NOT default to the perimeter wall thickness. If no callout exists, flag the row as uncertain.
+5. Cross check dimensions with other sheets to confirm the correct measurement before going to calculations.
+
+CATEGORY FIELD (REQUIRED) — every element you return MUST carry one of these category strings, chosen by what the element IS in construction terms:
+{categories_list}
+Group elements in this canonical order: Footings → Walls → Slab on Grade → Suspended Slab → Columns → Beams → Piers / Caissons → Equipment Pads → Sidewalks / Curbs → Stairs / Landings → Sumps / Pits → Other Concrete. If you cannot avoid extracting a non-concrete item (e.g. you misread a callout), set its category to "Non-Concrete" so the server can drop it cleanly — never assign a concrete category to a non-concrete item.
 
 Below is the extracted text from the drawings (page markers included):
 
@@ -383,6 +563,7 @@ Below is the extracted text from the drawings (page markers included):
 
 Follow Step 1 (Ingest and Orient) and Step 2 (Extract Dimensions) of the concrete-takeoff skill. Identify EVERY concrete structural element you can see (footings, slab on grade, walls, columns, piers, slabs on deck, equipment pads, sidewalks, driveways, sumps, sloped bases, etc.). For each, list:
 - A descriptive name and unique element ID (F1, F2, W1, S1, C1, etc.)
+- Its concrete category from the list above
 - Width, length, depth/thickness (in feet; convert inches: 6\" = 0.5 ft)
 - Quantity if there are multiples (e.g., 9 column footings)
 - Any reinforcement / strength specs you noticed
@@ -433,7 +614,7 @@ Tapered / wedge elements (sloped sumps, sloped bases):
   Use depth_ft to store the AVERAGE depth = 0.5*(depth_start + depth_end).
 
 Sum cubic_yards across ALL elements (tapered elements must be POSITIVE additions, not deductions).
-Call the return_takeoff tool with all elements and the summary totals."""
+Every element MUST include its `category` field (Footings, Walls, Slab on Grade, Suspended Slab, Columns, Beams, Piers / Caissons, Equipment Pads, Sidewalks / Curbs, Stairs / Landings, Sumps / Pits, or Other Concrete). Do not include electrical, mechanical, plumbing, or steel as concrete elements — those are filtered out. Call the return_takeoff tool with all elements and the summary totals."""
     history.append({"role": "user", "content": calc})
 
     resp = client.messages.create(
@@ -501,12 +682,21 @@ Call the return_takeoff tool with all elements and the summary totals."""
     if parsed:
         # Deterministic Python recompute of every element's volume from the
         # extracted dimensions. Replaces Claude's arithmetic (which drifts ~1%
-        # across multiple trials) with a single canonical computation.
+        # across multiple trials) with a single canonical computation. Also
+        # normalises the category field against CONCRETE_CATEGORIES.
         audit = _verify_element_volumes(parsed.get("elements") or [])
+
+        # Drop electrical/mechanical/steel rows that snuck through and compute
+        # per-category subtotals so the UI can group the table without doing
+        # its own classification.
+        kept, dropped, by_category = _filter_and_group_elements(
+            parsed.get("elements") or []
+        )
+        parsed["elements"] = kept
 
         total_cf = 0.0
         total_cy = 0.0
-        for el in parsed.get("elements", []) or []:
+        for el in kept:
             try:
                 total_cf += float(el.get("cubic_feet") or 0)
                 total_cy += float(el.get("cubic_yards") or 0)
@@ -515,12 +705,15 @@ Call the return_takeoff tool with all elements and the summary totals."""
         parsed.setdefault("summary", {})
         parsed["summary"]["total_cubic_feet"] = round(total_cf, 2)
         parsed["summary"]["total_cubic_yards"] = round(total_cy, 2)
+        parsed["summary"]["by_category"] = by_category
         parsed["summary"]["verification"] = {
             "applied": True,
             "waste_factor": WASTE_FACTOR,
             "drift_threshold_pct": VOLUME_DRIFT_THRESHOLD * 100,
             "overrides": audit,
             "override_count": len(audit),
+            "non_concrete_dropped": dropped,
+            "non_concrete_dropped_count": len(dropped),
         }
         # When the tool returned no elements, attach the first-turn prose so
         # the frontend parser can attempt to extract rows from it.
