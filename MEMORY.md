@@ -31,7 +31,7 @@ Cloudflare config lives in `wrangler.jsonc` at repo root (`"assets": { "director
 - `concrete-takeoff/SKILL.md` — system prompt fragment loaded at boot; encodes the full extraction workflow (15 KB, ~6.8K chars after frontmatter strip → wait, now ~15K after Step 2.5/2.6 update)
 - `concrete-takeoff/scripts/trapezoidal_volume.py` — geometry helpers for sloped/non-rectangular elements. Currently a **reference module only** — not imported by `app.py`. If you want the AI to call it, reference its formulas from inside `SKILL.md`; if you want Python to call it for canonical math, import and wire it into `_verify_element_volumes` (currently only handles rectangular `w × l × d × qty`).
 - `lessons.jsonl` — starter seed for `/data/lessons.jsonl`; the deployed app auto-copies this on first boot
-- `render.yaml` — Render blueprint; current Gunicorn config is **`--workers 1 --worker-class gthread --threads 4 --timeout 300`**. Workers dropped 2→1 on 2026-05-13 to halve peak memory under concurrent uploads (Claude API calls are IO-bound, threads handle concurrency fine). Timeout was raised 120→300s earlier because 12MB PDFs take ~2 min just to upload on slow connections.
+- `render.yaml` — Render blueprint; current Gunicorn config is **`--workers 1 --worker-class gthread --threads 4 --timeout 600`**. Workers dropped 2→1 on 2026-05-13 to halve peak memory under concurrent uploads (Claude API calls are IO-bound, threads handle concurrency fine). Timeout was raised 120→300s (slow uploads of large PDFs), then 300→600s on 2026-05-21 (high-DPI tile rendering plus a larger multi-image payload lengthens each request).
 - `wrangler.jsonc` — Cloudflare Workers config (added 2026-05-13). `"assets": { "directory": "." }` serves files from repo root. Cloudflare auto-deploys on push to `main`.
 - `requirements.txt`, `.env.example`, `.gitignore`, `SYSTEM_PROMPT.md`
 
@@ -61,6 +61,17 @@ Claude's reported numbers are discarded if they drift more than 1% from this can
 - `WASTE_FACTOR` env var (default `1.05`) — set on Render Environment tab to override globally.
 - Drift threshold (`VOLUME_DRIFT_THRESHOLD`) is hardcoded at 1%; expose as env var if tuning needed.
 - Only handles the rectangular formula. Trapezoidal/sloped elements should encode an **average depth** in `depth_ft` (Claude is instructed to do this in SKILL.md). If a per-element waste override or trapezoidal schema is added later, both must be threaded through `_verify_element_volumes` AND the `_TAKEOFF_TOOL` input_schema.
+
+## Vision pipeline (drawing rendering)
+
+`select_and_render_vision` in `app.py` decides how each PDF page reaches Claude. Construction sheets are too large to send whole — shrinking a 36" sheet to a single image (~43 DPI) left dimension text illegible, the dominant takeoff-error source. Reworked 2026-05-21:
+
+- Pages are scored by `_score_page_priority` — schedules, foundation plans, sections, structural sheet numbers, and dense feet-inch callouts rank high.
+- High-priority pages render at `TILE_RENDER_SCALE` (~151 DPI) and are sliced into overlapping ~1024px tiles, kept just under Anthropic's ~1.15 MP image cap so the API does not silently re-downsample them.
+- The 200K context window is the hard limit. `VISION_TOKEN_BUDGET` (~135K estimated image tokens) buys full tiling for roughly the top 3–4 large sheets; lower-priority sheets get one reduced-resolution thumbnail; the rest are covered by extracted text only.
+- Tunable via env vars, no code redeploy: `TILE_RENDER_SCALE`, `VISION_TOKEN_BUDGET`, `MAX_VISION_IMAGES`, `MAX_RENDER_PX`, `MAX_PDF_CHARS`. Lower `TILE_RENDER_SCALE` or `MAX_RENDER_PX` if Render OOMs on large renders.
+- `_RENDER_LOCK` serialises page rendering so peak memory stays bounded to one bitmap under concurrent uploads.
+- **Deferred:** multi-API-call batching to cover an entire large sheet set at full resolution (the single-call path caps coverage at ~3–4 fully-tiled sheets), and vector-geometry extraction.
 
 ## Tool-call schema (Claude → Flask)
 
@@ -124,7 +135,7 @@ Track of items raised but not yet implemented:
   - `CLAUDE_MODEL` — defaults to `claude-sonnet-4-6` (latest Sonnet generation)
   - `WASTE_FACTOR` — optional; defaults to `1.05`
   - `LESSONS_FILE` — optional override of `/data/lessons.jsonl`
-- **Health endpoint:** `/api/health` returns `{ok, model, api_key_loaded, skill_loaded, skill_chars, pdf_engine, pdf_engine_loaded, pdf_engine_version, pdf_engine_error}`. Use `skill_chars` to verify SKILL.md updates landed after a deploy, and `pdf_engine_loaded` to verify pypdfium2's C binding is healthy.
+- **Health endpoint:** `/api/health` returns `{ok, model, api_key_loaded, skill_loaded, skill_chars, vision_render_scale, vision_token_budget, pdf_engine, pdf_engine_loaded, pdf_engine_version, pdf_engine_error}`. Use `skill_chars` to verify SKILL.md updates landed after a deploy, `vision_render_scale` to confirm the high-DPI tiling build is live, and `pdf_engine_loaded` to verify pypdfium2's C binding is healthy.
 
 ## Things Claude (the assistant) cannot do for the user
 
@@ -136,6 +147,10 @@ Track of items raised but not yet implemented:
 
 ## Conversation history
 
+- **May 21, 2026** — High-DPI drawing tiling:
+  - Replaced the vision pipeline. The old path rendered each drawing page then shrank it to 1568px (~43 DPI), leaving dimension text and callouts illegible — the dominant source of takeoff error. New `select_and_render_vision` renders priority sheets at ~151 DPI and slices them into overlapping ~1024px tiles (under the API's ~1.15 MP cap so they are not re-downsampled), ranks pages by a dimension-bearing heuristic, and spends a context-window token budget on the top sheets first; lower-priority sheets get a single thumbnail, the rest are text-only. Dropped the 10-page render cap, raised text cap 40K→80K chars, raised Gunicorn timeout 300→600s.
+  - Backend-only change (`app.py`, `render.yaml`); `index.html` untouched and the new response fields (`vision_tiles_rendered`, `pdf_page_count`) are additive. Verified by syntax check + unit tests of the new pure functions; not end-to-end tested before this deploy.
+  - Deferred: multi-call batching for full-set coverage; vector-geometry extraction.
 - **May 1, 2026** — Initial Render deployment setup. Blueprint linked, first deploy.
 - **May 13, 2026** — Memory fixes + frontend host migration:
   - Render OOM'd on a large drawing render. Root cause: PyPDF2 loaded the entire PDF binary + all parsed images into RAM, then 2 Gunicorn workers doubled peak under concurrency on a 512MB Starter instance. Fix: swapped PyPDF2 → pypdfium2 with explicit per-page close(), dropped workers 2→1 with 4 threads, added `gc.collect()` after each upload, added pypdfium2 health probe at `/api/health`. User then upgraded Render instance plan separately.
