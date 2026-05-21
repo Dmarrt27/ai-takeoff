@@ -7,6 +7,7 @@ import os
 import gc
 import io
 import json
+import math
 import re
 import hashlib
 import traceback
@@ -62,15 +63,37 @@ client = Anthropic(api_key=_API_KEY) if _API_KEY else None
 # Model used for analysis. Can be overridden with CLAUDE_MODEL env var.
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-# Cap text sent to Claude. Drawings PDFs are text-light per page; this gives
-# good coverage of a 25-30 page set without blowing the context window.
-MAX_PDF_CHARS = 40000
+# Cap text sent to Claude. Construction PDFs are text-light per page, and the
+# vision tiles dominate the context budget — so this stays modest on purpose.
+MAX_PDF_CHARS = int(os.environ.get("MAX_PDF_CHARS", "80000"))
 
-# Pages with fewer than this many characters are assumed to be vector/raster
-# drawings with no machine-readable text; they are rendered to images for vision.
+# --- Vision rendering -----------------------------------------------------
+# Drawing sheets are rendered at high DPI and sliced into overlapping tiles so
+# dimension text stays legible — a full-size sheet shrunk to a single image is
+# not. pdfium render scale: 1.0 == 72 DPI, so 2.1 ≈ 151 DPI (1/8" text ≈ 19px).
+TILE_RENDER_SCALE = float(os.environ.get("TILE_RENDER_SCALE", "2.1"))
+# Hard cap on a rendered page's long edge (px). Scale is reduced for oversized
+# sheets so one render can't blow the memory budget.
+MAX_RENDER_PX = int(os.environ.get("MAX_RENDER_PX", "6000"))
+# Max tile edge. 1024px keeps a tile near ~1.05 MP — just under Anthropic's
+# image cap — so the API does NOT downscale it and the model sees every pixel
+# rendered. Larger tiles are silently downsampled, throwing away the DPI gain.
+TILE_MAX_PX = 1024
+# Tiles overlap by this many px so an element on a seam stays whole in at
+# least one tile.
+TILE_OVERLAP_PX = 128
+# Vision budget in estimated image tokens. The 200K context window is the real
+# limit: legible drawings are token-heavy, so the budget buys high-resolution
+# tiles for the highest-priority sheets and thumbnails for the rest.
+VISION_TOKEN_BUDGET = int(os.environ.get("VISION_TOKEN_BUDGET", "135000"))
+# Hard cap on images per request (Anthropic allows 100; leave headroom).
+MAX_VISION_IMAGES = int(os.environ.get("MAX_VISION_IMAGES", "95"))
+# A page with less than this many characters of extractable text has no text
+# layer — almost certainly a drawing, so vision is essential for it.
 VISION_TEXT_THRESHOLD = 100
-# Maximum pages to render — limits memory and per-request vision token cost.
-MAX_VISION_PAGES = 10
+# Serialises page rendering across worker threads so peak memory stays bounded
+# to a single rendered bitmap regardless of concurrent uploads.
+_RENDER_LOCK = threading.Lock()
 
 # Path to the bundled concrete-takeoff skill. The skill encodes the full
 # professional workflow (ingest → extract → calculate → group → output) and
@@ -116,16 +139,15 @@ def extract_pdf_text(pdf_path):
     """Extract text from a PDF page-by-page, releasing each page after use.
 
     Uses pypdfium2 (Google's PDFium C library) which streams pages on demand
-    and exposes explicit close() calls. For large image-heavy drawing PDFs
-    this keeps peak memory bounded to one page at a time instead of the
-    whole document, which is what PyPDF2 was doing.
+    and exposes explicit close() calls, keeping peak memory bounded to one
+    page at a time instead of the whole document.
 
-    Returns (full_text, sparse_page_indices) where sparse_page_indices are
-    0-based page numbers whose text yield fell below VISION_TEXT_THRESHOLD —
-    candidates for vision-based rendering.
+    Returns (full_text, page_texts) where page_texts[i] is the raw extracted
+    text of 0-based page i — used downstream to rank pages for the vision
+    tile budget.
     """
     text_parts = []
-    sparse_pages = []
+    page_texts = []
     pdf = pdfium.PdfDocument(pdf_path)
     try:
         for i in range(len(pdf)):
@@ -140,49 +162,193 @@ def extract_pdf_text(pdf_path):
                     tp.close()
             finally:
                 page.close()
+            page_texts.append(page_text)
             text_parts.append(f"\n--- PAGE {i+1} ---\n{page_text}")
-            if len(page_text.strip()) < VISION_TEXT_THRESHOLD:
-                sparse_pages.append(i)
     finally:
         pdf.close()
-    return "".join(text_parts), sparse_pages
+    return "".join(text_parts), page_texts
 
 
-def render_pages_as_images(pdf_path, page_indices):
-    """Render sparse PDF pages to JPEG images for Claude vision.
+# Keywords that mark a sheet as dimension-bearing — the sheets a concrete
+# takeoff depends on most. Weighted so structural plans, schedules, and
+# sections win the tile budget (per SKILL.md, concrete dims live on S-sheets).
+_PRIORITY_STRONG = [
+    "schedule", "foundation plan", "footing", "section", "structural",
+    "framing plan", "wall section", "slab on grade", "grade beam",
+    "stem wall", "retaining wall", "pier", "caisson",
+]
+_PRIORITY_MED = ["plan", "elevation", "detail", "general notes", "typ"]
+# Feet-and-inches callout, e.g. 8'-0" or 12' - 6 — dense on dimensioned sheets.
+_DIM_CALLOUT_RE = re.compile(r"\d+'\s*-\s*\d")
+# Structural sheet number in a title block, e.g. S1, S-1, S2.
+_STRUCT_SHEET_RE = re.compile(r"\bS-?\d")
 
-    Pages are rendered at 2x scale (144 DPI) then resized to fit within
-    1568px — Claude's optimal input size. Returns a list of dicts with
-    page number, base64-encoded JPEG data, and media_type.
+
+def _score_page_priority(text):
+    """Heuristic score for how likely a page carries takeoff dimensions.
+
+    Higher scores win the high-resolution tile budget. The 200K context window
+    only fits a handful of fully-legible sheets, so the budget must go to the
+    sheets that actually carry concrete dimensions.
     """
+    raw = text or ""
+    low = raw.lower()
+    score = 3 * sum(low.count(k) for k in _PRIORITY_STRONG)
+    score += sum(low.count(k) for k in _PRIORITY_MED)
+    score += 2 * min(len(_DIM_CALLOUT_RE.findall(raw)), 12)
+    if _STRUCT_SHEET_RE.search(raw):
+        score += 4
+    # No text layer at all — definitely a drawing; vision is the only signal.
+    if len(raw.strip()) < VISION_TEXT_THRESHOLD:
+        score += 6
+    return score
+
+
+def _grid_count(length_px, max_px, overlap):
+    """Number of overlapping tiles of `max_px` needed to cover `length_px`."""
+    if length_px <= max_px:
+        return 1
+    return math.ceil((length_px - overlap) / (max_px - overlap))
+
+
+def _tile_boxes(w, h):
+    """Tile a w×h image into overlapping (x0, y0, x1, y1, row, col) boxes.
+
+    The last row/column is aligned to the far edge so the final tile is full
+    size rather than a thin sliver.
+    """
+    cols = _grid_count(w, TILE_MAX_PX, TILE_OVERLAP_PX)
+    rows = _grid_count(h, TILE_MAX_PX, TILE_OVERLAP_PX)
+    step = TILE_MAX_PX - TILE_OVERLAP_PX
+    boxes = []
+    for r in range(rows):
+        y0 = 0 if rows == 1 else min(r * step, h - TILE_MAX_PX)
+        for c in range(cols):
+            x0 = 0 if cols == 1 else min(c * step, w - TILE_MAX_PX)
+            boxes.append((x0, y0, min(x0 + TILE_MAX_PX, w),
+                          min(y0 + TILE_MAX_PX, h), r, c))
+    return boxes, rows, cols
+
+
+def _img_token_estimate(w, h):
+    """Approximate Anthropic image token cost, mirroring its ~1.15 MP cap."""
+    return int(min(w * h, 1_150_000) / 750)
+
+
+def _render_tiles(page, page_no, scale):
+    """Render one page at high resolution and slice it into overlapping tiles.
+
+    PNG is used (not JPEG) because line art has no gradients and JPEG ringing
+    blurs thin dimension lines and small callout text.
+    """
+    bitmap = page.render(scale=scale)
+    try:
+        pil = bitmap.to_pil()
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+    finally:
+        bitmap.close()
+    boxes, rows, cols = _tile_boxes(pil.width, pil.height)
+    tiles = []
+    for (x0, y0, x1, y1, r, c) in boxes:
+        buf = io.BytesIO()
+        pil.crop((x0, y0, x1, y1)).save(buf, format="PNG")
+        tiles.append({
+            "page": page_no, "kind": "tile",
+            "row": r + 1, "col": c + 1, "rows": rows, "cols": cols,
+            "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "media_type": "image/png",
+        })
+    pil.close()
+    return tiles
+
+
+def _render_overview(page, page_no):
+    """Render one page as a single reduced-resolution overview thumbnail."""
+    bitmap = page.render(scale=2.0)
+    try:
+        pil = bitmap.to_pil()
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+    finally:
+        bitmap.close()
+    w, h = pil.size
+    if max(w, h) > TILE_MAX_PX:
+        ratio = TILE_MAX_PX / max(w, h)
+        pil = pil.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=85)
+    pil.close()
+    return {
+        "page": page_no, "kind": "overview",
+        "row": 0, "col": 0, "rows": 1, "cols": 1,
+        "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        "media_type": "image/jpeg",
+    }
+
+
+def select_and_render_vision(pdf_path, page_texts):
+    """Choose which pages get high-resolution tiles vs. a thumbnail, and render.
+
+    Pages are ranked by _score_page_priority so the token budget is spent on
+    the dimension-bearing sheets first. A page is tiled at TILE_RENDER_SCALE
+    while VISION_TOKEN_BUDGET lasts; once it is exhausted, remaining pages get
+    a single overview thumbnail each (until MAX_VISION_IMAGES is hit); the
+    lowest-priority pages get neither and are covered by extracted text only.
+
+    Returns image dicts in document order:
+      {page, kind: 'tile'|'overview', row, col, rows, cols, data, media_type}
+    """
+    n = len(page_texts)
+    if n == 0:
+        return []
+    order = sorted(range(n),
+                   key=lambda i: (-_score_page_priority(page_texts[i]), i))
+
     images = []
+    tokens_used = 0
     pdf = pdfium.PdfDocument(pdf_path)
     try:
-        for i in page_indices[:MAX_VISION_PAGES]:
-            page = pdf[i]
+        for idx in order:
+            if len(images) >= MAX_VISION_IMAGES:
+                break
             try:
-                bitmap = page.render(scale=2.0)
-                try:
-                    pil_img = bitmap.to_pil()
-                    w, h = pil_img.size
-                    if max(w, h) > 1568:
-                        ratio = 1568 / max(w, h)
-                        pil_img = pil_img.resize(
-                            (int(w * ratio), int(h * ratio)), Image.LANCZOS
+                with _RENDER_LOCK:
+                    page = pdf[idx]
+                    try:
+                        pw, ph = page.get_size()
+                        long_pt = max(pw, ph) or 1.0
+                        short_pt = min(pw, ph)
+                        scale = TILE_RENDER_SCALE
+                        if long_pt * scale > MAX_RENDER_PX:
+                            scale = MAX_RENDER_PX / long_pt
+                        boxes, _, _ = _tile_boxes(int(pw * scale),
+                                                  int(ph * scale))
+                        tile_cost = sum(
+                            _img_token_estimate(x1 - x0, y1 - y0)
+                            for (x0, y0, x1, y1, _, _) in boxes
                         )
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format='JPEG', quality=85)
-                    images.append({
-                        'page': i + 1,
-                        'data': base64.b64encode(buf.getvalue()).decode('utf-8'),
-                        'media_type': 'image/jpeg',
-                    })
-                finally:
-                    bitmap.close()
-            finally:
-                page.close()
+                        ov_long = min(long_pt * 2.0, TILE_MAX_PX)
+                        ov_cost = _img_token_estimate(
+                            ov_long, ov_long * short_pt / long_pt)
+
+                        if (len(images) + len(boxes) <= MAX_VISION_IMAGES
+                                and tokens_used + tile_cost
+                                <= VISION_TOKEN_BUDGET):
+                            images.extend(_render_tiles(page, idx + 1, scale))
+                            tokens_used += tile_cost
+                        elif tokens_used + ov_cost <= VISION_TOKEN_BUDGET:
+                            images.append(_render_overview(page, idx + 1))
+                            tokens_used += ov_cost
+                        # else: budget spent — this page is text-only
+                    finally:
+                        page.close()
+            except Exception as e:
+                app.logger.warning("Vision render failed for page %d: %s",
+                                    idx + 1, e)
     finally:
         pdf.close()
+    images.sort(key=lambda im: (im["page"], im["row"], im["col"]))
     return images
 
 
@@ -555,6 +721,8 @@ CATEGORY FIELD (REQUIRED) — every element you return MUST carry one of these c
 {categories_list}
 Group elements in this canonical order: Footings → Walls → Slab on Grade → Suspended Slab → Columns → Beams → Piers / Caissons → Equipment Pads → Sidewalks / Curbs → Stairs / Landings → Sumps / Pits → Other Concrete. If you cannot avoid extracting a non-concrete item (e.g. you misread a callout), set its category to "Non-Concrete" so the server can drop it cleanly — never assign a concrete category to a non-concrete item.
 
+HOW THE DRAWINGS ARE PROVIDED: Drawing sheets are attached as images. A large sheet is sliced into a grid of overlapping high-resolution tiles, each labeled "[Page N — tile row R of …, col C of …]"; a smaller or lower-priority sheet is attached as one reduced-resolution thumbnail labeled "[Page N — whole-sheet overview …]". Every image carrying the same page number is part of ONE physical sheet — reassemble its tiles in your mind into the full sheet before reading dimensions. Because adjacent tiles overlap, the same footing, wall, column, or dimension callout can appear in two neighboring tiles — count each physical element ONLY ONCE. Pages with no attached image are represented by their extracted text only.
+
 Below is the extracted text from the drawings (page markers included):
 
 <drawings>
@@ -575,10 +743,16 @@ If a dimension is not stated, use a reasonable construction default and note it.
     if page_images:
         turn1_content = [{"type": "text", "text": initial}]
         for img in page_images:
-            turn1_content.append({
-                "type": "text",
-                "text": f"\nRendered drawing — page {img['page']}:",
-            })
+            if img.get("kind") == "tile" and img["rows"] * img["cols"] > 1:
+                label = (f"\n[Page {img['page']} — tile row {img['row']} of "
+                         f"{img['rows']}, col {img['col']} of {img['cols']}; "
+                         f"high-resolution, tiles overlap]")
+            elif img.get("kind") == "tile":
+                label = f"\n[Page {img['page']} — full sheet, high-resolution]"
+            else:
+                label = (f"\n[Page {img['page']} — whole-sheet overview, "
+                         f"reduced resolution]")
+            turn1_content.append({"type": "text", "text": label})
             turn1_content.append({
                 "type": "image",
                 "source": {
@@ -750,6 +924,8 @@ def health():
         "api_key_loaded": client is not None,
         "skill_loaded": bool(SKILL_PROMPT),
         "skill_chars": len(SKILL_PROMPT),
+        "vision_render_scale": TILE_RENDER_SCALE,
+        "vision_token_budget": VISION_TOKEN_BUDGET,
         "pdf_engine": "pypdfium2",
         "pdf_engine_loaded": PDF_ENGINE_OK,
         "pdf_engine_version": PDF_ENGINE_VERSION,
@@ -835,8 +1011,8 @@ def upload_file():
         f.save(save_path)
 
         try:
-            pdf_text, sparse_pages = extract_pdf_text(save_path)
-            page_images = render_pages_as_images(save_path, sparse_pages) if sparse_pages else []
+            pdf_text, page_texts = extract_pdf_text(save_path)
+            page_images = select_and_render_vision(save_path, page_texts)
             result = extract_quantities_with_claude(pdf_text, page_images, filename)
         finally:
             try:
@@ -847,11 +1023,14 @@ def upload_file():
             # OS so the next request starts fresh instead of inheriting peak.
             gc.collect()
 
+        tiles = sum(1 for im in page_images if im.get('kind') == 'tile')
         return jsonify({
             'success': True,
             'filename': filename,
+            'pdf_page_count': len(page_texts),
             'pages_text_chars': len(pdf_text),
-            'vision_pages_rendered': len(page_images),
+            'vision_pages_rendered': len({im['page'] for im in page_images}),
+            'vision_tiles_rendered': tiles,
             'data': result,
         })
     except Exception as e:
