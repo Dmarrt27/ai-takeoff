@@ -28,14 +28,12 @@ Cloudflare config lives in `wrangler.jsonc` at repo root (`"assets": { "director
 - `app.py` — Flask backend, all `/api/*` endpoints, Anthropic SDK calls, volume verification. PDF text extraction uses **pypdfium2** with explicit per-page `close()` calls; was PyPDF2 until 2026-05-13 (swapped because PyPDF2 held the entire PDF tree in RAM, OOMing Render on image-heavy drawings)
 - `index.html` — single-file frontend, vanilla JS, served by Netlify
 - `learning.py` — extracts a "lesson" from each user correction, appends to `lessons.jsonl`, injects lessons into the Turn 1 prompt
-- `concrete-takeoff/SKILL.md` — system prompt fragment loaded at boot; encodes the full extraction workflow (15 KB, ~6.8K chars after frontmatter strip → wait, now ~15K after Step 2.5/2.6 update)
+- `concrete-takeoff/SKILL.md` — system prompt fragment loaded at boot; encodes the dimension/geometry/cross-section extraction workflow (~27K chars after frontmatter strip). Sent as a cached `cache_control` system block. Rebar, formwork, and Step 5 output-format sections were dropped 2026-05-22 — the `return_takeoff` tool captures only concrete volume, so they were dead weight on every request.
 - `concrete-takeoff/scripts/trapezoidal_volume.py` — geometry helpers for sloped/non-rectangular elements. Currently a **reference module only** — not imported by `app.py`. If you want the AI to call it, reference its formulas from inside `SKILL.md`; if you want Python to call it for canonical math, import and wire it into `_verify_element_volumes` (currently only handles rectangular `w × l × d × qty`).
 - `lessons.jsonl` — starter seed for `/data/lessons.jsonl`; the deployed app auto-copies this on first boot
 - `render.yaml` — Render blueprint; current Gunicorn config is **`--workers 1 --worker-class gthread --threads 4 --timeout 600`**. Workers dropped 2→1 on 2026-05-13 to halve peak memory under concurrent uploads (Claude API calls are IO-bound, threads handle concurrency fine). Timeout was raised 120→300s (slow uploads of large PDFs), then 300→600s on 2026-05-21 (high-DPI tile rendering plus a larger multi-image payload lengthens each request).
 - `wrangler.jsonc` — Cloudflare Workers config (added 2026-05-13). `"assets": { "directory": "." }` serves files from repo root. Cloudflare auto-deploys on push to `main`.
 - `requirements.txt`, `.env.example`, `.gitignore`, `SYSTEM_PROMPT.md`
-
-`learning copy.py` is a legacy duplicate; the active module is `learning.py`.
 
 ## Persistent storage (`/data`)
 
@@ -146,6 +144,12 @@ Track of items raised but not yet implemented:
 - Run `gh auth login` — needs interactive browser flow
 
 ## Conversation history
+
+- **May 22, 2026** — Token-cost cleanup (lower per-upload API spend, no accuracy change):
+  - **Prompt caching.** The system prompt (`SKILL_PROMPT` body + the `return_takeoff` tool schema, which renders just before it) is now sent as a `cache_control` ephemeral block — `system_blocks` in `extract_quantities_with_claude`. The API serves it at ~10% cost on the retry call and on any upload within the 5-minute cache window. Drawing tiles are deliberately left uncached: they are unique per upload, so a breakpoint there would only pay the cache-write premium with nothing to read it back.
+  - **Retry no longer re-sends drawings.** The tool-retry loop used to append to `history` (the image-bearing first turn) and re-send the whole ~135K-token tile payload up to 2×. It now seeds a separate `retry_messages` from a TEXT-ONLY copy of the first user turn (the `initial` prompt). The retry only restructures Claude's existing prose analysis into a `return_takeoff` call — it does not re-read drawings — so this is accuracy-neutral, same rationale as the single-call collapse.
+  - **SKILL.md trimmed** ~29K→27K chars: removed the rebar-quantity section + weights table, the formwork-area section, and Step 5 (markdown/xlsx output). The `return_takeoff` tool captures only concrete volume, so that content produced numbers with nowhere to go and instructed work (xlsx via a skill, `/mnt/skills/...`) the API call cannot do. All dimension/geometry/cross-section workflow kept.
+  - Deleted `learning copy.py` (unused legacy duplicate). Backend + skill only; `index.html` and the tool schema untouched.
 
 - **May 21, 2026** — High-DPI drawing tiling:
   - Replaced the vision pipeline. The old path rendered each drawing page then shrank it to 1568px (~43 DPI), leaving dimension text and callouts illegible — the dominant source of takeoff error. New `select_and_render_vision` renders priority sheets at ~151 DPI and slices them into overlapping ~1024px tiles (under the API's ~1.15 MP cap so they are not re-downsampled), ranks pages by a dimension-bearing heuristic, and spends a context-window token budget on the top sheets first; lower-priority sheets get a single thumbnail, the rest are text-only. Dropped the 10-page render cap, raised text cap 40K→80K chars, raised Gunicorn timeout 300→600s.

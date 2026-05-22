@@ -14,7 +14,7 @@ description: >
 
 # Concrete Quantity Takeoff Skill
 
-You are performing a professional concrete quantity takeoff for civil/infrastructure and industrial construction projects. Your job is to extract and calculate concrete volumes (CY), rebar quantities (lbs), and formwork areas (SF) from uploaded PDF drawings or user-provided dimensions.
+You are performing a professional concrete quantity takeoff for civil/infrastructure and industrial construction projects. Your job is to extract and calculate concrete volumes in cubic yards (CY) from uploaded PDF drawings or user-provided dimensions.
 
 ---
 
@@ -306,44 +306,6 @@ Convert all dimensions to feet first, then:
 
 Add a **5% waste/overbreak factor** to all volumes unless the user specifies otherwise.
 
-#### Rebar (Reinforcing Steel)
-If rebar is shown or specified on the drawings:
-- Count bars, note size (e.g., #4, #5, #6) and spacing
-- Calculate total linear feet per bar size
-- Apply standard weight factors (lbs/LF): see reference table below
-- Sum total weight in **lbs**, and also express as **tons** (÷ 2000)
-
-If rebar is not shown but element type is known, note that rebar was not quantified for that element.
-
-**Standard rebar weights (lbs per linear foot):**
-| Bar Size | lbs/LF |
-|---|---|
-| #3 | 0.376 |
-| #4 | 0.668 |
-| #5 | 1.043 |
-| #6 | 1.502 |
-| #7 | 2.044 |
-| #8 | 2.670 |
-| #9 | 3.400 |
-| #10 | 4.303 |
-| #11 | 5.313 |
-
-#### Formwork (Surface Area)
-Calculate contact area (SF) for all formed surfaces — surfaces that require a form to retain concrete during pour:
-
-| Element | Formed Surfaces |
-|---|---|
-| Isolated footing | 4 sides (L×D×2 + W×D×2) |
-| Continuous footing | 2 long sides (L×D×2) |
-| Slab on grade | Edge forms only (perimeter × T) |
-| Wall | 2 faces (L×H×2) |
-| Column (rect.) | 4 faces (perimeter × H) |
-| Column (round) | Circumference × H |
-| Beam (formed soffit) | Bottom + 2 sides |
-| Pier/caisson | Typically not formed (drilled); note if casing used |
-
-Do **not** include top surfaces (screeded/finished, not formed) or surfaces cast against earth (SOG bottom, pile sides in soil).
-
 ---
 
 ### Step 4 — Organize Output by Element Type
@@ -361,31 +323,6 @@ End with a **Project Total** summary table.
 
 ---
 
-### Step 5 — Output Format
-
-Produce three outputs:
-
-#### A) Summary Narrative
-One paragraph describing what was found, any scaling assumptions made, elements that lacked full dimension data, and any notes the estimator should verify.
-
-#### B) Structured Quantity Table (inline)
-Present a clean markdown table with columns:
-
-| Element ID | Description | L (ft) | W (ft) | D/H (ft) | Count | Concrete (CY) | Rebar (lbs) | Formwork (SF) | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-
-Include subtotals per group and a project total row.
-
-#### C) Downloadable Spreadsheet
-After presenting the table inline, generate an `.xlsx` file using the xlsx skill with:
-- Sheet 1: Quantity takeoff table (same as above, formatted)
-- Sheet 2: Assumptions & Notes log
-- Sheet 3: Rebar schedule (if rebar was quantified)
-
-To generate the spreadsheet, read `/mnt/skills/public/xlsx/SKILL.md` first.
-
----
-
 ## Handling Scale Calculations
 
 When dimensions must be scaled from the drawing:
@@ -400,9 +337,7 @@ When dimensions must be scaled from the drawing:
 
 Apply these defaults unless the user specifies otherwise:
 - Concrete waste/overbreak: **+5%**
-- Rebar lap splices: add **15%** to calculated bar lengths
-- Formwork: use **contact area** method (no deductions for openings < 10 SF)
-- Units: all volumes in **cubic yards (CY)**, weights in **lbs** (also shown as tons), areas in **square feet (SF)**
+- Units: all volumes in **cubic yards (CY)**
 - If an element count is not explicit, assume **1** and note it
 
 ---
@@ -444,8 +379,6 @@ Before presenting output, verify:
 - [ ] All CY calculations divided by the correct cubic-units-to-CY constant
 - [ ] Round columns use π × r² (not diameter²)
 - [ ] Waste factor applied to all volumes
-- [ ] Rebar lap splice factor applied
-- [ ] Formwork excludes earth-formed and top/finished surfaces
 - [ ] Subtotals and project total match sum of line items
 
 ---

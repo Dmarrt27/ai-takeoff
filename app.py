@@ -844,6 +844,19 @@ def extract_quantities_with_claude(pdf_text, page_images, filename):
         "You are a construction quantity takeoff specialist."
     )
 
+    # Send the system prompt as a cacheable block. It is byte-identical on
+    # every upload (and on the retry call below), so this cache_control
+    # breakpoint lets the API serve the system prompt — and the return_takeoff
+    # tool schema, which renders just before it — at ~10% cost on any call
+    # within the 5-minute cache window. The drawing tiles deliberately get no
+    # breakpoint: they are unique per upload, so caching them would only pay
+    # the cache-write premium with nothing to read it back.
+    system_blocks = [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
     categories_list = ", ".join(f'"{c}"' for c in CONCRETE_CATEGORIES)
     initial = f"""Analyzing a PDF of construction drawings: {filename}
 {lessons_section}
@@ -927,7 +940,7 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
         model=MODEL,
         max_tokens=16000,
         temperature=TEMPERATURE,
-        system=system_prompt,
+        system=system_blocks,
         messages=history,
         tools=[_TAKEOFF_TOOL],
         tool_choice={"type": "auto"},
@@ -953,15 +966,26 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
     # frontend as narrative text and the UI shows the "AI returned narrative
     # analysis" fallback instead of a table. Retries force tool_choice so the
     # structured result is guaranteed.
+    #
+    # The retry only restructures the prose analysis Claude already produced
+    # into a return_takeoff call — it does not re-read the drawings. So the
+    # retry conversation is seeded with a TEXT-ONLY copy of the first user turn
+    # (the `initial` prompt, no image blocks), keeping the ~135K-token drawing-
+    # tile payload out of every retry request. Same rationale as collapsing the
+    # old two-call flow: re-sending drawings to a structuring step spends
+    # tokens for no accuracy gain — Python recomputes every volume regardless.
     MAX_TOOL_RETRIES = 2
+    retry_messages = None
     for _ in range(MAX_TOOL_RETRIES):
         if (parsed or {}).get("elements"):
             break
         if len((prose_response or "").strip()) < 100:
             break
-        history.append({"role": "assistant", "content": resp.content})
+        if retry_messages is None:
+            retry_messages = [{"role": "user", "content": initial}]
+        retry_messages.append({"role": "assistant", "content": resp.content})
         if tool_block:
-            history.append({
+            retry_messages.append({
                 "role": "user",
                 "content": [{
                     "type": "tool_result",
@@ -981,7 +1005,7 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
                 }],
             })
         else:
-            history.append({
+            retry_messages.append({
                 "role": "user",
                 "content": (
                     "You did not call the return_takeoff tool. Call it now and "
@@ -998,8 +1022,8 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
             model=MODEL,
             max_tokens=8000,
             temperature=TEMPERATURE,
-            system=system_prompt,
-            messages=history,
+            system=system_blocks,
+            messages=retry_messages,
             tools=[_TAKEOFF_TOOL],
             tool_choice={"type": "tool", "name": "return_takeoff"},
         )
