@@ -58,10 +58,18 @@ def handle_preflight():
 # Initialize Anthropic client only if a key is present so the server still
 # boots in dev mode without one (we'll surface a clean error on /api/upload).
 _API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-client = Anthropic(api_key=_API_KEY) if _API_KEY else None
+# max_retries lifts the SDK default (2) so transient 429/500/529/timeout
+# errors retry with exponential backoff before an upload fails outright.
+client = Anthropic(api_key=_API_KEY, max_retries=4) if _API_KEY else None
 
 # Model used for analysis. Can be overridden with CLAUDE_MODEL env var.
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+
+# Sampling temperature. The API defaults to 1.0 (full sampling), which makes a
+# takeoff vary run-to-run on the same drawings. 0 takes the most-probable
+# reading every time — as reproducible as the model allows, which is what a
+# measurement tool needs. Override with CLAUDE_TEMPERATURE.
+TEMPERATURE = float(os.environ.get("CLAUDE_TEMPERATURE", "0"))
 
 # Cap text sent to Claude. Construction PDFs are text-light per page, and the
 # vision tiles dominate the context budget — so this stays modest on purpose.
@@ -791,6 +799,7 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
     resp = client.messages.create(
         model=MODEL,
         max_tokens=16000,
+        temperature=TEMPERATURE,
         system=system_prompt,
         messages=history,
         tools=[_TAKEOFF_TOOL],
@@ -800,6 +809,9 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
     # the reasoning Claude emitted before the tool call — kept as fallback
     # analysis text and to gauge whether a retry is worthwhile.
     prose_response = "".join(getattr(b, "text", "") for b in resp.content)
+    # A "max_tokens" stop means the response was cut off mid-output, so the
+    # tool input may be incomplete — tracked to flag the result downstream.
+    truncated = getattr(resp, "stop_reason", None) == "max_tokens"
 
     tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
     if tool_block:
@@ -858,11 +870,13 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
         resp = client.messages.create(
             model=MODEL,
             max_tokens=8000,
+            temperature=TEMPERATURE,
             system=system_prompt,
             messages=history,
             tools=[_TAKEOFF_TOOL],
             tool_choice={"type": "tool", "name": "return_takeoff"},
         )
+        truncated = getattr(resp, "stop_reason", None) == "max_tokens"
         tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
         if tool_block:
             parsed = tool_block.input
@@ -903,6 +917,16 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
             "non_concrete_dropped": dropped,
             "non_concrete_dropped_count": len(dropped),
         }
+        # Surface a truncated response so a cut-off takeoff is not trusted silently.
+        if truncated:
+            parsed["summary"]["truncated"] = True
+            warn = ("WARNING: the model response hit its max_tokens limit, so "
+                    "this takeoff may be incomplete. Re-run to confirm.")
+            if isinstance(parsed["summary"].get("assumptions"), list):
+                parsed["summary"]["assumptions"].append(warn)
+            else:
+                parsed["summary"]["assumptions"] = [warn]
+
         # When the tool returned no elements, attach the reasoning prose so
         # the frontend parser can attempt to extract rows from it.
         if not parsed.get("elements") and prose_response:
