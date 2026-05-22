@@ -655,11 +655,13 @@ def _filter_and_group_elements(elements):
 
 
 def extract_quantities_with_claude(pdf_text, page_images, filename):
-    """Two-turn conversation: identify elements, then compute volumes.
+    """Single-call analysis: identify elements, compute volumes, return data.
 
-    page_images is a list of {page, data, media_type} dicts rendered from
-    sparse pages. When present they are attached to Turn 1 so Claude can
-    read dimension callouts directly from the vector/raster drawing layers.
+    Claude identifies every concrete element, calculates each volume, and
+    calls the return_takeoff tool in a single request. page_images is a list
+    of {page, data, media_type} dicts rendered from sparse pages; when present
+    they are attached so Claude can read dimension callouts directly from the
+    vector/raster drawing layers.
     """
     if client is None:
         raise RuntimeError(
@@ -691,7 +693,7 @@ def extract_quantities_with_claude(pdf_text, page_images, filename):
         prompt_text = pdf_text
 
     history = []
-    prose_response = ""  # first-turn prose — saved as fallback analysis text
+    prose_response = ""  # reasoning Claude emits before the tool call
 
     lessons_block = format_lessons_for_prompt()
     lessons_section = f"\n{lessons_block}\n" if lessons_block else ""
@@ -729,19 +731,32 @@ Below is the extracted text from the drawings (page markers included):
 {prompt_text}
 </drawings>
 
-Follow Step 1 (Ingest and Orient) and Step 2 (Extract Dimensions) of the concrete-takeoff skill. Identify EVERY concrete structural element you can see (footings, slab on grade, walls, columns, piers, slabs on deck, equipment pads, sidewalks, driveways, sumps, sloped bases, etc.). For each, list:
+Work through the concrete-takeoff skill in this single response, in order:
+
+STEPS 1-2 — IDENTIFY & EXTRACT (do this in prose first): Follow Step 1 (Ingest and Orient) and Step 2 (Extract Dimensions). Identify EVERY concrete structural element you can see (footings, slab on grade, walls, columns, piers, slabs on deck, equipment pads, sidewalks, driveways, sumps, sloped bases, etc.). For each, note:
 - A descriptive name and unique element ID (F1, F2, W1, S1, C1, etc.)
 - Its concrete category from the list above
 - Width, length, depth/thickness (in feet; convert inches: 6\" = 0.5 ft)
 - Quantity if there are multiples (e.g., 9 column footings)
 - Any reinforcement / strength specs you noticed
 - For sloped elements: starting height, ending height, slope percentage, and the wedge formula used
+If a dimension is not stated, use a reasonable construction default and note it.
 
-If a dimension is not stated, use a reasonable construction default and note it. Respond with prose first, then a JSON list."""
-    # Build Turn 1 content: text prompt always present; attach rendered page
-    # images when available so Claude can read dimension callouts directly.
+STEP 3 — CALCULATE: Perform Step 3 (Calculate Quantities) and compute the concrete volume for each element. Apply a 5% waste/overbreak factor unless drawings specify otherwise.
+Standard rectangular elements:
+  cubic_feet = width_ft × length_ft × depth_ft × qty
+  cubic_yards = cubic_feet / 27
+Tapered / wedge elements (sloped sumps, sloped bases):
+  cubic_feet = 0.5 × (depth_start_ft + depth_end_ft) × width_ft × length_ft × qty
+  cubic_yards = cubic_feet / 27
+  Use depth_ft to store the AVERAGE depth = 0.5*(depth_start + depth_end).
+Sum cubic_yards across ALL elements (tapered elements must be POSITIVE additions, not deductions).
+
+FINALLY: Run the Quality Checks, then call the return_takeoff tool with every concrete element and the summary totals. Every element MUST include its `category` field (Footings, Walls, Slab on Grade, Suspended Slab, Columns, Beams, Piers / Caissons, Equipment Pads, Sidewalks / Curbs, Stairs / Landings, Sumps / Pits, or Other Concrete). Do not include electrical, mechanical, plumbing, or steel as concrete elements — those are filtered out."""
+    # Build the request content: text prompt always present; attach rendered
+    # page images when available so Claude can read dimension callouts directly.
     if page_images:
-        turn1_content = [{"type": "text", "text": initial}]
+        user_content = [{"type": "text", "text": initial}]
         for img in page_images:
             if img.get("kind") == "tile" and img["rows"] * img["cols"] > 1:
                 label = (f"\n[Page {img['page']} — tile row {img['row']} of "
@@ -752,8 +767,8 @@ If a dimension is not stated, use a reasonable construction default and note it.
             else:
                 label = (f"\n[Page {img['page']} — whole-sheet overview, "
                          f"reduced resolution]")
-            turn1_content.append({"type": "text", "text": label})
-            turn1_content.append({
+            user_content.append({"type": "text", "text": label})
+            user_content.append({
                 "type": "image",
                 "source": {
                     "type": "base64",
@@ -762,88 +777,87 @@ If a dimension is not stated, use a reasonable construction default and note it.
                 },
             })
     else:
-        turn1_content = initial
+        user_content = initial
 
-    history.append({"role": "user", "content": turn1_content})
+    history.append({"role": "user", "content": user_content})
 
+    # Single analysis call: Claude identifies every concrete element,
+    # calculates volumes, and calls return_takeoff in one request. Collapsed
+    # from a two-call flow on 2026-05-22 — the old second call re-sent every
+    # drawing image, doubling input-token usage against the API rate limit for
+    # no accuracy gain (Python recomputes all volumes in _verify_element_volumes
+    # regardless). tool_choice="auto" lets Claude reason in prose before the
+    # tool call; the retry loop below forces the tool if nothing usable returns.
     resp = client.messages.create(
         model=MODEL,
-        max_tokens=6000,
-        system=system_prompt,
-        messages=history,
-    )
-    # Join every text block so multi-block responses aren't truncated.
-    prose_response = "".join(getattr(b, "text", "") for b in resp.content)
-    history.append({"role": "assistant", "content": prose_response})
-
-    calc = """Now perform Step 3 (Calculate Quantities) of the concrete-takeoff skill and compute the concrete volume for each element. Apply a 5% waste/overbreak factor unless drawings specify otherwise, and run the Quality Checks before calling the return_takeoff tool.
-
-Standard rectangular elements:
-  cubic_feet = width_ft × length_ft × depth_ft × qty
-  cubic_yards = cubic_feet / 27
-
-Tapered / wedge elements (sloped sumps, sloped bases):
-  cubic_feet = 0.5 × (depth_start_ft + depth_end_ft) × width_ft × length_ft × qty
-  cubic_yards = cubic_feet / 27
-  Use depth_ft to store the AVERAGE depth = 0.5*(depth_start + depth_end).
-
-Sum cubic_yards across ALL elements (tapered elements must be POSITIVE additions, not deductions).
-Every element MUST include its `category` field (Footings, Walls, Slab on Grade, Suspended Slab, Columns, Beams, Piers / Caissons, Equipment Pads, Sidewalks / Curbs, Stairs / Landings, Sumps / Pits, or Other Concrete). Do not include electrical, mechanical, plumbing, or steel as concrete elements — those are filtered out. Call the return_takeoff tool with all elements and the summary totals."""
-    history.append({"role": "user", "content": calc})
-
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=4000,
+        max_tokens=16000,
         system=system_prompt,
         messages=history,
         tools=[_TAKEOFF_TOOL],
-        tool_choice={"type": "tool", "name": "return_takeoff"},
+        tool_choice={"type": "auto"},
     )
+    # Join every text block so multi-block responses aren't truncated. This is
+    # the reasoning Claude emitted before the tool call — kept as fallback
+    # analysis text and to gauge whether a retry is worthwhile.
+    prose_response = "".join(getattr(b, "text", "") for b in resp.content)
 
-    # tool_choice forces a ToolUseBlock as the first content item
     tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
     if tool_block:
         parsed = tool_block.input
     else:
-        # Should never happen with forced tool_choice, but keep a text fallback
-        raw = "".join(getattr(b, "text", "") for b in resp.content)
-        parsed = _parse_json_block(raw)
+        # auto chose not to call the tool — salvage JSON from the prose if any
+        parsed = _parse_json_block(prose_response)
 
-    # Re-prompt Claude when the forced tool call came back with elements=[]
-    # but the Turn 1 prose clearly identified concrete elements. Without this,
-    # the response leaks back to the frontend as narrative text and the UI
-    # shows the "AI returned narrative analysis" fallback instead of a table.
+    # Re-prompt when the call returned no usable takeoff — either no tool call
+    # at all, or a return_takeoff call with elements=[] despite reasoning that
+    # clearly identified concrete. Without this the response leaks back to the
+    # frontend as narrative text and the UI shows the "AI returned narrative
+    # analysis" fallback instead of a table. Retries force tool_choice so the
+    # structured result is guaranteed.
     MAX_TOOL_RETRIES = 2
     for _ in range(MAX_TOOL_RETRIES):
-        if not tool_block:
-            break
         if (parsed or {}).get("elements"):
             break
         if len((prose_response or "").strip()) < 100:
             break
         history.append({"role": "assistant", "content": resp.content})
-        history.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_block.id,
-                "is_error": True,
+        if tool_block:
+            history.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "is_error": True,
+                    "content": (
+                        "Your return_takeoff call had elements=[] but your "
+                        "analysis identified concrete elements. Call return_takeoff "
+                        "again and populate elements with EVERY concrete element "
+                        "from that analysis. For each: name (e.g. 'Foundation Slab', "
+                        "'Column Footing F1'), category, width_ft, length_ft, "
+                        "depth_ft, qty, cubic_feet (= width × length × depth × qty), "
+                        "cubic_yards (= cubic_feet / 27), notes. Also fill "
+                        "summary.total_cubic_yards, summary.total_cubic_feet, and "
+                        "summary.assumptions. Do not return an empty elements list."
+                    ),
+                }],
+            })
+        else:
+            history.append({
+                "role": "user",
                 "content": (
-                    "Your return_takeoff call had elements=[] but your earlier "
-                    "analysis identified concrete elements. Call return_takeoff "
-                    "again and populate elements with EVERY concrete element "
-                    "from that analysis. For each: name (e.g. 'Foundation Slab', "
-                    "'Column Footing F1'), width_ft, length_ft, depth_ft, qty, "
+                    "You did not call the return_takeoff tool. Call it now and "
+                    "populate elements with EVERY concrete element from your "
+                    "analysis. For each: name (e.g. 'Foundation Slab', 'Column "
+                    "Footing F1'), category, width_ft, length_ft, depth_ft, qty, "
                     "cubic_feet (= width × length × depth × qty), cubic_yards "
                     "(= cubic_feet / 27), notes. Also fill summary.total_cubic_yards, "
                     "summary.total_cubic_feet, and summary.assumptions. Do not "
                     "return an empty elements list."
                 ),
-            }],
-        })
+            })
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=4000,
+            max_tokens=8000,
             system=system_prompt,
             messages=history,
             tools=[_TAKEOFF_TOOL],
@@ -889,13 +903,13 @@ Every element MUST include its `category` field (Footings, Walls, Slab on Grade,
             "non_concrete_dropped": dropped,
             "non_concrete_dropped_count": len(dropped),
         }
-        # When the tool returned no elements, attach the first-turn prose so
+        # When the tool returned no elements, attach the reasoning prose so
         # the frontend parser can attempt to extract rows from it.
         if not parsed.get("elements") and prose_response:
             parsed["summary"]["analysis"] = prose_response
         return parsed
 
-    # Shouldn't be reached with forced tool_choice, but keep as safety net
+    # Reached only if the call made no tool call and no JSON could be salvaged
     return {
         "elements": [],
         "summary": {
