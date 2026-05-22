@@ -482,6 +482,21 @@ WASTE_FACTOR = float(os.environ.get("WASTE_FACTOR", "1.05"))
 # Drift threshold above which Claude's value triggers an audit entry.
 VOLUME_DRIFT_THRESHOLD = 0.01  # 1%
 
+# --- Geometric sanity-check thresholds ------------------------------------
+# These flag (never drop) elements whose extracted geometry is physically
+# impossible. The model's main failure mode is over-decomposing one element
+# into overlapping pieces and double-counting it. All env-tunable.
+_SLAB_CATEGORIES = ("Slab on Grade", "Suspended Slab")
+# Slab-on-Grade total plan area beyond this multiple of the footprint implies
+# a double-counted or over-decomposed slab.
+SLAB_AREA_TOLERANCE = float(os.environ.get("SLAB_AREA_TOLERANCE", "1.5"))
+# A single wall longer than this multiple of the footprint perimeter cannot
+# physically belong to the structure.
+WALL_LENGTH_TOLERANCE = float(os.environ.get("WALL_LENGTH_TOLERANCE", "1.15"))
+# Slab / wall thicknesses (ft) above these are almost always misread callouts.
+MAX_SLAB_THICKNESS_FT = float(os.environ.get("MAX_SLAB_THICKNESS_FT", "3.0"))
+MAX_WALL_THICKNESS_FT = float(os.environ.get("MAX_WALL_THICKNESS_FT", "4.0"))
+
 
 # Keyword fallback used when Claude returns an element without a category
 # (older lessons, fallback prose parsing, or schema slip). Matches on name +
@@ -660,6 +675,118 @@ def _filter_and_group_elements(elements):
             "element_count": s["element_count"],
         })
     return kept, dropped, by_category
+
+
+def _elem_dims(el):
+    """Parse an element's (width, length, depth, qty) as floats.
+
+    Unparseable width/length/depth become 0.0 and a missing/bad qty becomes
+    1.0, so geometry math can run without per-field guards.
+    """
+    def _f(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+    return (_f(el.get("width_ft")), _f(el.get("length_ft")),
+            _f(el.get("depth_ft")), _f(el.get("qty"), 1.0) or 1.0)
+
+
+def _geometric_sanity_checks(elements):
+    """Flag elements whose extracted geometry is physically implausible.
+
+    _verify_element_volumes recomputes volumes but trusts the dimensions the
+    model extracted. These checks compare those dimensions against the
+    building footprint to catch the model's dominant failure mode: over-
+    decomposing one physical element into overlapping pieces and double-
+    counting (e.g. a base slab split into "zones" that together cover far
+    more area than the structure has). The footprint is anchored to the
+    largest single slab, which the model reads far more reliably than a
+    decomposed element.
+
+    Returns a list of {check, element, detail} warnings. Nothing is dropped
+    or recomputed — the takeoff is flagged so a wrong result is visible to
+    the estimator instead of being trusted silently.
+    """
+    els = elements or []
+    warnings = []
+
+    # Per-element plausibility: impossible or misread dimensions.
+    for el in els:
+        w, l, d, _ = _elem_dims(el)
+        name = el.get("name") or "(unnamed)"
+        cat = (el.get("category") or "").strip()
+        if min(w, l, d) <= 0:
+            warnings.append({
+                "check": "nonpositive_dimension",
+                "element": name,
+                "detail": (f"dimensions {w}x{l}x{d} ft — an element cannot "
+                           f"have a zero or negative dimension; a callout "
+                           f"was likely missed."),
+            })
+        if cat in _SLAB_CATEGORIES and d > MAX_SLAB_THICKNESS_FT:
+            warnings.append({
+                "check": "implausible_thickness",
+                "element": name,
+                "detail": (f"{cat} listed {d} ft thick — slabs are rarely "
+                           f"over {MAX_SLAB_THICKNESS_FT} ft; verify the "
+                           f"thickness callout."),
+            })
+        if cat == "Walls" and w > MAX_WALL_THICKNESS_FT:
+            warnings.append({
+                "check": "implausible_thickness",
+                "element": name,
+                "detail": (f"wall listed {w} ft thick — verify the width "
+                           f"callout was not misread."),
+            })
+
+    # Footprint-anchored checks. Anchor to the largest suspended slab (a roof
+    # or floor spans the whole structure as one piece); fall back to the
+    # largest slab on grade only when no suspended slab exists.
+    suspended = [e for e in els
+                 if (e.get("category") or "").strip() == "Suspended Slab"]
+    on_grade = [e for e in els
+                if (e.get("category") or "").strip() == "Slab on Grade"]
+    ref_area = ref_w = ref_l = 0.0
+    for el in (suspended or on_grade):
+        w, l, _, _ = _elem_dims(el)
+        if w * l > ref_area:
+            ref_area, ref_w, ref_l = w * l, w, l
+
+    if ref_area > 0:
+        # A slab on grade is poured once across the footprint; far more total
+        # area means pieces of one slab were counted more than once.
+        sog_area = sum(_elem_dims(e)[0] * _elem_dims(e)[1] * _elem_dims(e)[3]
+                       for e in on_grade)
+        if sog_area > SLAB_AREA_TOLERANCE * ref_area:
+            warnings.append({
+                "check": "slab_area_exceeds_footprint",
+                "element": "(all Slab on Grade)",
+                "detail": (f"Slab-on-Grade plan area totals {sog_area:,.0f} "
+                           f"sq ft against a ~{ref_area:,.0f} sq ft footprint "
+                           f"({sog_area / ref_area:.1f}x) — a ground slab is "
+                           f"poured once; likely a double-counted or over-"
+                           f"decomposed slab."),
+            })
+        # No single wall can be longer than the structure's perimeter.
+        perimeter = 2.0 * (ref_w + ref_l)
+        if perimeter > 0:
+            for el in els:
+                if (el.get("category") or "").strip() != "Walls":
+                    continue
+                _, l, _, _ = _elem_dims(el)
+                if l > WALL_LENGTH_TOLERANCE * perimeter:
+                    warnings.append({
+                        "check": "wall_longer_than_perimeter",
+                        "element": el.get("name") or "(unnamed)",
+                        "detail": (f"wall length {l:,.0f} ft exceeds the "
+                                   f"structure's ~{perimeter:,.0f} ft "
+                                   f"perimeter — likely the whole perimeter "
+                                   f"summed into one element, or a misread "
+                                   f"dimension."),
+                    })
+
+    return warnings
 
 
 def extract_quantities_with_claude(pdf_text, page_images, filename):
@@ -896,6 +1023,10 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
         )
         parsed["elements"] = kept
 
+        # Flag elements whose extracted geometry is physically implausible
+        # (double-counted / over-decomposed) so a wrong takeoff is visible.
+        geometry_warnings = _geometric_sanity_checks(kept)
+
         total_cf = 0.0
         total_cy = 0.0
         for el in kept:
@@ -916,6 +1047,8 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
             "override_count": len(audit),
             "non_concrete_dropped": dropped,
             "non_concrete_dropped_count": len(dropped),
+            "geometry_warnings": geometry_warnings,
+            "geometry_warning_count": len(geometry_warnings),
         }
         # Surface a truncated response so a cut-off takeoff is not trusted silently.
         if truncated:
@@ -926,6 +1059,16 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
                 parsed["summary"]["assumptions"].append(warn)
             else:
                 parsed["summary"]["assumptions"] = [warn]
+
+        # Surface geometry warnings the same way so the UI shows them.
+        if geometry_warnings:
+            gwarn = (f"WARNING: {len(geometry_warnings)} geometric sanity "
+                     f"check(s) flagged this takeoff as possibly over-counted "
+                     f"or misread — see verification.geometry_warnings.")
+            if isinstance(parsed["summary"].get("assumptions"), list):
+                parsed["summary"]["assumptions"].append(gwarn)
+            else:
+                parsed["summary"]["assumptions"] = [gwarn]
 
         # When the tool returned no elements, attach the reasoning prose so
         # the frontend parser can attempt to extract rows from it.

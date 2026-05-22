@@ -211,6 +211,7 @@ For each element, extract or derive:
 - If dimensions must be scaled: use the scale bar or stated scale ratio to derive dimensions from the drawing geometry. Always note when a dimension is scaled vs. labeled.
 -Cross check dimensions with other "S" sheets to verify all dimensions are correct before moving to calculations
 -Note that not all concrete sections are perfectly rectangular, be aware of these sections
+- **Never assume the layout is symmetrical.** Do not infer a dimension by mirroring the opposite side, and do not assume the structure is a clean rectangle. Opposite walls are frequently different lengths, footings differ side to side, interior chambers are unequal, and slab edges step in and out. Read the dimension callout for EVERY side of EVERY element individually — if a callout is genuinely missing, derive it per Step 2.6, never copy it from a "matching" element.
 -For concrete quantities, almost all important dimensions will be listed on "S" sheets
 - Record each element with a unique identifier (e.g., F1, F2, W1, S1, C1)
 
@@ -435,6 +436,7 @@ Before presenting output, verify:
 - [ ] Cast-in-place structural decks (require shoring) distinguished from composite metal-deck slabs (no shoring)
 
 **Geometry & math:**
+- [ ] No dimension was assumed by symmetry — every side of every element has its own callout read or derived (layouts are routinely asymmetrical)
 - [ ] Every element has an explicit geometry classification (Step 2.5) — no element silently treated as rectangular
 - [ ] Any element with a `% SLOPE` annotation, "TYP" thickness paired with a sloping face, or two different end thicknesses is classified as `TRAPEZOIDAL_PRISM` and computed with `0.5 × (d_min + d_max) × L × W`
 - [ ] Every implied dimension has a 4-line derivation block (label / needed-for / source / derivation arithmetic)
