@@ -12,6 +12,7 @@ import re
 import hashlib
 import traceback
 import threading
+import concurrent.futures
 import base64
 
 from PIL import Image
@@ -103,6 +104,34 @@ VISION_TEXT_THRESHOLD = 100
 # to a single rendered bitmap regardless of concurrent uploads.
 _RENDER_LOCK = threading.Lock()
 
+# --- Anthropic concurrency / timeout --------------------------------------
+# Per-call timeout (seconds). The Anthropic SDK default is ~600s which is the
+# same as the gunicorn worker --timeout — so a single slow call plus retries
+# can blow the whole worker. 150s leaves ~4 retries of headroom inside 600s.
+PER_CALL_TIMEOUT = float(os.environ.get("PER_CALL_TIMEOUT_S", "150"))
+# Module-level cap on total in-flight Anthropic calls across ALL uploads. With
+# gunicorn --workers 1 --threads 4 the worker can serve 4 uploads concurrently;
+# without this semaphore, multi-pass fan-out (Pass 1 + confirm passes) per
+# upload could spawn 5+ outbound calls each → 20+ in-flight, blowing rate
+# limits. The bound is global, not per-request, on purpose.
+_API_CALL_CONCURRENCY = int(os.environ.get("API_CALL_CONCURRENCY", "4"))
+_API_CALL_SEMAPHORE = threading.BoundedSemaphore(_API_CALL_CONCURRENCY)
+
+# --- Multi-pass extraction (Fix 1) ----------------------------------------
+# Below this sheet count, skip triage + multi-pass and use the single-call
+# path. Small sets don't benefit from fan-out and pay extra latency.
+SMALL_SET_THRESHOLD = int(os.environ.get("SMALL_SET_THRESHOLD", "4"))
+# Triage thumbnail size (cell long-edge px) and grid layout. Every sheet
+# renders as a small thumbnail; 6 thumbnails per grid image (3 × 2) lets a
+# 95-sheet set fit in ~16 grid images, well under the 100-image API cap.
+TRIAGE_THUMB_PX = int(os.environ.get("TRIAGE_THUMB_PX", "256"))
+TRIAGE_GRID_COLS = int(os.environ.get("TRIAGE_GRID_COLS", "3"))
+TRIAGE_GRID_ROWS = int(os.environ.get("TRIAGE_GRID_ROWS", "2"))
+# Confirm-pass batch size: how many tiles get sent per confirm-pass call. The
+# batch must fit inside the per-call image budget once the cached SKILL system
+# prompt is on top, with headroom for the roster JSON.
+CONFIRM_BATCH_TILES = int(os.environ.get("CONFIRM_BATCH_TILES", "30"))
+
 # Path to the bundled concrete-takeoff skill. The skill encodes the full
 # professional workflow (ingest → extract → calculate → group → output) and
 # is injected as the system prompt so every analysis follows it.
@@ -127,6 +156,63 @@ def load_concrete_takeoff_skill():
 
 # Cache the skill at import time — it doesn't change between requests.
 SKILL_PROMPT = load_concrete_takeoff_skill()
+
+
+def _system_blocks():
+    """Build the system prompt as Anthropic content blocks with prompt caching.
+
+    The SKILL is stable across every call in a request (and across requests),
+    so wrapping it in a `cache_control: ephemeral` block lets later calls
+    read the prefix from cache at ~0.1× the input-token price. The first
+    call in a flow pays the cache-write premium (~1.25×); every subsequent
+    call inside the 5-minute TTL pays the read price. Pass directly to
+    `client.messages.create(system=...)`.
+    """
+    text = (
+        "You are a construction quantity takeoff specialist. Follow the "
+        "concrete-takeoff skill below for the full workflow, formulas, "
+        "defaults, and quality checks.\n\n"
+        f"{SKILL_PROMPT}"
+    ) if SKILL_PROMPT else (
+        "You are a construction quantity takeoff specialist."
+    )
+    return [{
+        "type": "text",
+        "text": text,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _chat_call(messages, tools=None, tool_choice=None, max_tokens=16000):
+    """Wrap `client.messages.create` with the API semaphore + per-call timeout.
+
+    Centralises three things every Anthropic call in this app needs:
+    - Cached SKILL system prompt (see `_system_blocks`).
+    - Module-level semaphore so concurrent uploads + multi-pass fan-out can't
+      blow the rate limit (default 4 in-flight; configurable via env).
+    - Per-call timeout under the gunicorn worker --timeout so a hung call
+      fails fast inside budget instead of taking the worker down.
+    Raises RuntimeError if the Anthropic client isn't configured.
+    """
+    if client is None:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Create a .env file with "
+            "ANTHROPIC_API_KEY=sk-ant-... or export it in your shell."
+        )
+    kwargs = {
+        "model": MODEL,
+        "max_tokens": max_tokens,
+        "temperature": TEMPERATURE,
+        "system": _system_blocks(),
+        "messages": messages,
+        "timeout": PER_CALL_TIMEOUT,
+    }
+    if tools is not None:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    with _API_CALL_SEMAPHORE:
+        return client.messages.create(**kwargs)
 
 
 # Probe pypdfium2 at boot so a broken wheel surfaces in /api/health instead of
@@ -360,6 +446,289 @@ def select_and_render_vision(pdf_path, page_texts):
     return images
 
 
+def _compose_triage_grid(cells, cell_px):
+    """Composite up to TRIAGE_GRID_COLS×TRIAGE_GRID_ROWS thumbnails into one image.
+
+    Cells are laid out row-major (left→right, top→bottom). Each thumbnail is
+    centered in its cell so aspect-ratio differences don't bias the model
+    toward certain grid positions. Returns the grid image as a dict carrying
+    the 1-based page numbers in row-major order.
+    """
+    grid_w = cell_px * TRIAGE_GRID_COLS
+    grid_h = cell_px * TRIAGE_GRID_ROWS
+    canvas = Image.new("RGB", (grid_w, grid_h), "white")
+    pages = []
+    for idx, (thumb, page_no) in enumerate(cells):
+        row = idx // TRIAGE_GRID_COLS
+        col = idx % TRIAGE_GRID_COLS
+        x0 = col * cell_px
+        y0 = row * cell_px
+        cw, ch = thumb.size
+        canvas.paste(thumb,
+                     (x0 + (cell_px - cw) // 2, y0 + (cell_px - ch) // 2))
+        pages.append(page_no)
+        thumb.close()
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=80)
+    canvas.close()
+    return {
+        "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        "media_type": "image/jpeg",
+        "pages": pages,
+    }
+
+
+def _render_triage_grids(pdf_path, page_count):
+    """Render every page as a small thumbnail and composite N-up grid images.
+
+    Pass 0 (triage) sends one image per grid, not one per page — a 95-page
+    set composites into ~16 grid images, well under the 100-image API cap.
+    Each grid cell is TRIAGE_THUMB_PX on its long edge; pages are laid out
+    in row-major order so the model can map cell position to page number
+    using the label above each grid.
+    """
+    cell_px = TRIAGE_THUMB_PX
+    cells_per_grid = TRIAGE_GRID_COLS * TRIAGE_GRID_ROWS
+    if cells_per_grid <= 0:
+        return []
+    grids = []
+    pending = []  # (PIL image, 1-based page number)
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for i in range(page_count):
+            try:
+                with _RENDER_LOCK:
+                    page = pdf[i]
+                    try:
+                        pw, ph = page.get_size()
+                        long_pt = max(pw, ph) or 1.0
+                        # pdfium scale 1.0 == 72 DPI, so cell_px / long_pt
+                        # gives the scale that puts the long edge ~= cell_px.
+                        # Clamped so degenerate pages don't blow rendering.
+                        scale = max(0.25, min(2.0, cell_px / long_pt))
+                        bitmap = page.render(scale=scale)
+                        try:
+                            pil = bitmap.to_pil()
+                            if pil.mode != "RGB":
+                                pil = pil.convert("RGB")
+                        finally:
+                            bitmap.close()
+                    finally:
+                        page.close()
+                pil.thumbnail((cell_px, cell_px), Image.LANCZOS)
+                pending.append((pil, i + 1))
+            except Exception as e:
+                app.logger.warning(
+                    "Triage thumbnail failed for page %d: %s", i + 1, e)
+                continue
+            if len(pending) >= cells_per_grid:
+                grids.append(_compose_triage_grid(pending, cell_px))
+                pending = []
+        if pending:
+            grids.append(_compose_triage_grid(pending, cell_px))
+    finally:
+        pdf.close()
+    return grids
+
+
+def triage_sheets(pdf_path, page_count):
+    """Pass 0: classify every sheet via a single vision call.
+
+    Replaces the keyword heuristic in `_score_page_priority` — works on both
+    vector and scanned PDFs because it reads pixels, not the text layer.
+    Returns a dict {page_no: {sheet_type, carries_concrete_dims}} covering
+    every page (defaults applied to anything the model omits), or None on
+    any failure so the caller can fall back to the text-heuristic path.
+    """
+    if client is None or page_count <= 0:
+        return None
+    try:
+        grids = _render_triage_grids(pdf_path, page_count)
+    except Exception as e:
+        app.logger.warning("Triage rendering failed: %s", e)
+        return None
+    if not grids:
+        return None
+
+    intro = (
+        f"Below are {len(grids)} grid images. Each grid composites up to "
+        f"{TRIAGE_GRID_COLS * TRIAGE_GRID_ROWS} construction drawing sheets "
+        f"laid out in row-major order (left-to-right, top-to-bottom), at "
+        f"~{TRIAGE_THUMB_PX}px per cell. The 1-based page number for each "
+        f"cell is listed in the label above its grid.\n\n"
+        f"For EVERY page from 1 to {page_count}, classify the sheet by "
+        f"type and whether it carries concrete dimensions (callouts, "
+        f"schedules, or sections with depth/thickness). Use "
+        f"sheet_type='other' for any page you cannot classify confidently; "
+        f"do not omit a page. Call classify_sheets once with the full list."
+    )
+    content = [{"type": "text", "text": intro}]
+    for grid in grids:
+        label = (f"\n[Grid pages, row-major: "
+                 f"{', '.join(str(p) for p in grid['pages'])}]")
+        content.append({"type": "text", "text": label})
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": grid["media_type"],
+                "data": grid["data"],
+            },
+        })
+
+    try:
+        resp = _chat_call(
+            messages=[{"role": "user", "content": content}],
+            tools=[_TRIAGE_TOOL],
+            tool_choice={"type": "tool", "name": "classify_sheets"},
+            max_tokens=4000,
+        )
+    except Exception as e:
+        app.logger.warning("Triage call failed: %s", e)
+        return None
+
+    tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
+    if not tool_block:
+        return None
+    out = {}
+    for s in (tool_block.input or {}).get("sheets") or []:
+        try:
+            page = int(s["page"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if page < 1 or page > page_count:
+            continue
+        out[page] = {
+            "sheet_type": s.get("sheet_type") or "other",
+            "carries_concrete_dims": bool(s.get("carries_concrete_dims",
+                                                False)),
+        }
+    # Pages the model skipped default to 'other' with no concrete dims —
+    # the selection step decides what to do with them (typically: include
+    # only if no roster/confirm sheets were classified).
+    for page in range(1, page_count + 1):
+        out.setdefault(page, {"sheet_type": "other",
+                              "carries_concrete_dims": False})
+    return out
+
+
+def _bucket_pages_by_triage(page_count, triage):
+    """Pure: route each page into the roster or confirm bucket.
+
+    - Plans / schedules → roster (they carry the element list).
+    - Sections / details / elevations / notes → confirm (they carry depths).
+    - Anything else flagged carries_concrete_dims=True → confirm (safer to
+      read than to drop; roster needs plan-style information specifically).
+    """
+    roster_pages = []
+    confirm_pages = []
+    for page in range(1, page_count + 1):
+        info = (triage or {}).get(page) or {}
+        st = info.get("sheet_type", "other")
+        carries = info.get("carries_concrete_dims", False)
+        if st in ROSTER_SHEET_TYPES:
+            roster_pages.append(page)
+        elif st in CONFIRM_SHEET_TYPES:
+            confirm_pages.append(page)
+        elif carries:
+            confirm_pages.append(page)
+    return roster_pages, confirm_pages
+
+
+def _pack_confirm_batches(by_page, confirm_pages, remaining_budget, batch_cap):
+    """Pure: pack per-page tile lists into batches under batch_cap tiles each.
+
+    Truncates total tiles to remaining_budget (the global image cap minus
+    what the roster already consumed). A page whose tile count alone exceeds
+    batch_cap becomes its own oversize batch — splitting one sheet's tiles
+    across two confirm calls would break the "same page = one sheet" rule
+    the model uses to reassemble overlapping tiles.
+    """
+    batches = []
+    current = []
+    used = 0
+    for page in confirm_pages:
+        if used >= remaining_budget:
+            break
+        tiles = by_page.get(page, [])
+        if not tiles:
+            continue
+        if used + len(tiles) > remaining_budget:
+            tiles = tiles[: remaining_budget - used]
+        if not tiles:
+            continue
+        if current and len(current) + len(tiles) > batch_cap:
+            batches.append(current)
+            current = []
+        current.extend(tiles)
+        used += len(tiles)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _render_tiles_for_pages(pdf_path, pages_1based):
+    """Render given 1-based pages as high-res tiles in a single PDF open.
+
+    Returns {page_no: [tile dicts]}. A failed page gets an empty list so
+    the caller can iterate without per-page guards.
+    """
+    by_page = {}
+    if not pages_1based:
+        return by_page
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for page_no in pages_1based:
+            try:
+                with _RENDER_LOCK:
+                    page = pdf[page_no - 1]
+                    try:
+                        pw, ph = page.get_size()
+                        long_pt = max(pw, ph) or 1.0
+                        scale = TILE_RENDER_SCALE
+                        if long_pt * scale > MAX_RENDER_PX:
+                            scale = MAX_RENDER_PX / long_pt
+                        by_page[page_no] = _render_tiles(page, page_no, scale)
+                    finally:
+                        page.close()
+            except Exception as e:
+                app.logger.warning("Tile render failed for page %d: %s",
+                                   page_no, e)
+                by_page.setdefault(page_no, [])
+    finally:
+        pdf.close()
+    return by_page
+
+
+def select_vision_buckets(pdf_path, triage, page_texts):
+    """Bucket sheets by triage role, render full-res tiles per bucket.
+
+    Returns (roster_images, confirm_batches):
+    - roster_images: one flat tile list — Pass 1 reads them all in one call.
+    - confirm_batches: list of tile lists, each sized to fit one confirm
+      call's image budget; confirm passes fan out one batch per call.
+
+    Respects the global MAX_VISION_IMAGES cap across both buckets so a
+    sprawling sheet set can't overflow the API's per-call image limit.
+    """
+    n = len(page_texts)
+    if not triage or n == 0:
+        return [], []
+    roster_pages, confirm_pages = _bucket_pages_by_triage(n, triage)
+    by_page = _render_tiles_for_pages(pdf_path, roster_pages + confirm_pages)
+
+    roster_images = []
+    for page in roster_pages:
+        roster_images.extend(by_page.get(page, []))
+    if len(roster_images) > MAX_VISION_IMAGES:
+        roster_images = roster_images[:MAX_VISION_IMAGES]
+    remaining = max(0, MAX_VISION_IMAGES - len(roster_images))
+
+    confirm_batches = _pack_confirm_batches(
+        by_page, confirm_pages, remaining, CONFIRM_BATCH_TILES)
+    return roster_images, confirm_batches
+
+
 def _parse_json_block(text):
     """Pull the first {...} JSON object out of a Claude response."""
     # Try fenced ```json blocks first
@@ -412,6 +781,20 @@ CONCRETE_CATEGORIES = [
 # steel beam as a concrete element anyway.
 NON_CONCRETE_CATEGORY = "Non-Concrete"
 
+# Geometry classification tags — mirror SKILL.md Step 2.5 exactly so the model
+# uses one vocabulary across the skill instructions and the tool schema. The
+# server still computes volume rectangularly (width x length x depth x qty);
+# these tags are metadata until the verifier dispatches on them.
+GEOMETRY_TYPES = [
+    "RECT_PRISM",
+    "TRAPEZOIDAL_PRISM",
+    "STEPPED_PRISM",
+    "TAPERED_WALL",
+    "CYLINDER",
+    "FRUSTUM",
+    "CUSTOM",
+]
+
 # Tool definition that forces Claude to return structured takeoff data.
 # Using tool_choice={"type":"tool","name":"return_takeoff"} in the second
 # API call guarantees a ToolUseBlock response rather than prose text.
@@ -426,10 +809,21 @@ _TAKEOFF_TOOL = {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["name", "category", "width_ft", "length_ft",
-                                 "depth_ft", "qty", "cubic_feet", "cubic_yards",
-                                 "notes"],
+                    "required": ["element_id", "name", "category",
+                                 "geometry_type", "width_ft", "length_ft",
+                                 "depth_ft", "qty", "cubic_feet",
+                                 "cubic_yards", "notes"],
                     "properties": {
+                        "element_id": {
+                            "type": "string",
+                            "description": (
+                                "Stable unique identifier for this physical "
+                                "element (e.g. F1, F2, W1, S1, C1). One ID "
+                                "per element — the same ID identifies it "
+                                "wherever it appears across plan, schedule, "
+                                "and section sheets."
+                            ),
+                        },
                         "name":        {"type": "string"},
                         "category": {
                             "type": "string",
@@ -452,9 +846,50 @@ _TAKEOFF_TOOL = {
                                 "or steel — those rows will be discarded."
                             ),
                         },
+                        "geometry_type": {
+                            "type": "string",
+                            "enum": GEOMETRY_TYPES,
+                            "description": (
+                                "Geometry classification — the SKILL.md Step "
+                                "2.5 tag for this element. RECT_PRISM = "
+                                "constant thickness; TRAPEZOIDAL_PRISM = "
+                                "thickness varies linearly (sloped slabs, "
+                                "sump floors, tapered mats); STEPPED_PRISM = "
+                                "discrete thickness steps; TAPERED_WALL = "
+                                "battered wall; CYLINDER = round "
+                                "column/caisson; FRUSTUM = round pier with "
+                                "varying radius; CUSTOM = decomposed into "
+                                "sub-shapes. width_ft, length_ft and depth_ft "
+                                "MUST still be populated so width × length × "
+                                "depth × qty equals the true volume "
+                                "regardless of this tag; d_min, d_max and "
+                                "radius_ft are metadata."
+                            ),
+                        },
                         "width_ft":    {"type": "number"},
                         "length_ft":   {"type": "number"},
                         "depth_ft":    {"type": "number"},
+                        "d_min": {
+                            "type": "number",
+                            "description": (
+                                "Minimum thickness in feet — set for "
+                                "TRAPEZOIDAL_PRISM and TAPERED_WALL elements."
+                            ),
+                        },
+                        "d_max": {
+                            "type": "number",
+                            "description": (
+                                "Maximum thickness in feet — set for "
+                                "TRAPEZOIDAL_PRISM and TAPERED_WALL elements."
+                            ),
+                        },
+                        "radius_ft": {
+                            "type": "number",
+                            "description": (
+                                "Radius in feet — set for CYLINDER and "
+                                "FRUSTUM elements."
+                            ),
+                        },
                         "qty":         {"type": "number"},
                         "cubic_feet":  {"type": "number"},
                         "cubic_yards": {"type": "number"},
@@ -469,6 +904,75 @@ _TAKEOFF_TOOL = {
                     "total_cubic_yards": {"type": "number"},
                     "total_cubic_feet":  {"type": "number"},
                     "assumptions":       {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    },
+}
+
+
+# --- Pass 0: vision-based sheet triage ------------------------------------
+# Per-sheet roles. Roster sheets carry the element list (plan + schedule);
+# confirm sheets carry the depths/heights/thicknesses that plans omit.
+ROSTER_SHEET_TYPES = {"plan", "schedule"}
+CONFIRM_SHEET_TYPES = {"section", "detail", "elevation", "notes"}
+SHEET_TYPES = sorted(ROSTER_SHEET_TYPES | CONFIRM_SHEET_TYPES |
+                     {"cover", "other"})
+
+# Triage tool — Pass 0 classifies every sheet by type so the full-res tile
+# budget targets dimension-bearing sheets directly, replacing the brittle
+# text-keyword heuristic in _score_page_priority. Scanned sets have no text
+# layer, so vision-based classification is the only signal that works on
+# both vector and scanned input.
+_TRIAGE_TOOL = {
+    "name": "classify_sheets",
+    "description": (
+        "Classify every drawing sheet by its role (plan, section, etc.) "
+        "and whether it carries concrete dimensions."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["sheets"],
+        "properties": {
+            "sheets": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["page", "sheet_type",
+                                 "carries_concrete_dims"],
+                    "properties": {
+                        "page": {
+                            "type": "integer",
+                            "description": (
+                                "1-based page number of the sheet in the PDF."
+                            ),
+                        },
+                        "sheet_type": {
+                            "type": "string",
+                            "enum": SHEET_TYPES,
+                            "description": (
+                                "Role of this sheet. 'plan' = plan view "
+                                "(foundation/structural/framing plan); "
+                                "'schedule' = tabular schedule of footings, "
+                                "columns, walls, etc.; 'section' = cut "
+                                "section showing depths/heights; 'detail' = "
+                                "enlarged detail with reinforcement or "
+                                "dimensions; 'elevation' = building "
+                                "elevation; 'notes' = general notes or "
+                                "specifications; 'cover' = title or index "
+                                "sheet; 'other' = anything else."
+                            ),
+                        },
+                        "carries_concrete_dims": {
+                            "type": "boolean",
+                            "description": (
+                                "True iff this sheet shows concrete "
+                                "callouts, schedules, or sections with "
+                                "depth/thickness — the sheets a takeoff "
+                                "needs to read."
+                            ),
+                        },
+                    },
                 },
             },
         },
@@ -789,7 +1293,445 @@ def _geometric_sanity_checks(elements):
     return warnings
 
 
-def extract_quantities_with_claude(pdf_text, page_images, filename):
+# --- Multi-pass merge (Fix 1) ---------------------------------------------
+# Roster wins on plan-view data (the geometry it sees first-hand); confirm
+# passes win on section/detail data (depths, thicknesses, geometry tags the
+# plan view doesn't show).
+_ROSTER_AUTHORITATIVE_FIELDS = (
+    "width_ft", "length_ft", "qty", "category", "name", "element_id",
+)
+_CONFIRM_AUTHORITATIVE_FIELDS = (
+    "depth_ft", "d_min", "d_max", "radius_ft", "geometry_type", "notes",
+)
+# Values that count as "no data" for merge purposes — never overwrite a real
+# value with one of these. Lets a confirm pass that omits depth_ft (or sets
+# it to 0 because it couldn't read the callout) keep the roster's provisional.
+_EMPTY_MERGE_VALUES = (None, "", 0, 0.0)
+
+
+def _normalize_name(name):
+    """Lowercase + collapse whitespace for fingerprint comparison."""
+    return " ".join((name or "").lower().split())
+
+
+def _fingerprint(el):
+    """Stable hash of (category, plan-dim, name) for dedup of confirm additions.
+
+    Width/length rounded to 0.1 ft (~1") so minor extraction noise doesn't
+    create false negatives. Category is included so two same-shape elements
+    of different types (a 2×4 footing vs. a 2×4 pad) don't collapse.
+    """
+    cat = (el.get("category") or "").strip()
+    try:
+        w = round(float(el.get("width_ft") or 0), 1)
+        l = round(float(el.get("length_ft") or 0), 1)
+    except (TypeError, ValueError):
+        w = l = 0.0
+    return (cat, w, l, _normalize_name(el.get("name")))
+
+
+def _merge_element_field(existing, new, field, prefer_new):
+    """Update one field on `existing` from `new`. Returns True if changed.
+
+    Never overwrites a real value with an empty/zero/None. When both sides
+    have real values: `prefer_new=True` updates, `False` keeps existing.
+    """
+    if field not in new:
+        return False
+    new_val = new[field]
+    if new_val in _EMPTY_MERGE_VALUES:
+        return False
+    old_val = existing.get(field)
+    if old_val in _EMPTY_MERGE_VALUES:
+        existing[field] = new_val
+        return True
+    if not prefer_new or old_val == new_val:
+        return False
+    existing[field] = new_val
+    return True
+
+
+def _merge_elements(roster_elements, confirm_results):
+    """Merge roster + confirm-pass element lists by element_id, dedup additions.
+
+    Algorithm:
+    1. Seed `by_id` from the roster. Auto-assign IDs to any roster element
+       that didn't get one from Pass 1.
+    2. For each confirm-pass element: if its element_id matches an existing
+       row, update authoritative fields (roster wins width/length/qty;
+       confirm wins depth/thickness/geometry/notes).
+    3. Otherwise, the confirm pass is adding a new element. Compute its
+       fingerprint (category, plan dims, normalized name) and dedup against
+       everything already in `by_id` — a confirm pass that re-discovers a
+       roster element gets dropped, and two confirm passes adding the same
+       new element only land it once. Server assigns a `auto_C{pass}_{n}`
+       ID so two passes can't collide on a suggested ID.
+
+    Returns (merged_list, audit_entries). audit_entries describes every
+    auto-ID assignment, field update, addition, and dedup for the response.
+    """
+    audit = []
+    by_id = {}
+    auto_seq = 0
+    for el in roster_elements or []:
+        eid = (el.get("element_id") or "").strip()
+        if not eid:
+            auto_seq += 1
+            eid = f"auto_R{auto_seq}"
+            el = dict(el, element_id=eid)
+            audit.append({"kind": "roster_id_assigned",
+                          "element_id": eid,
+                          "name": el.get("name", "(unnamed)")})
+        if eid in by_id:
+            audit.append({"kind": "duplicate_roster_id",
+                          "element_id": eid,
+                          "name": el.get("name", "(unnamed)")})
+            continue
+        by_id[eid] = dict(el)
+
+    seen_fingerprints = {_fingerprint(el): eid for eid, el in by_id.items()}
+
+    for pass_idx, confirm_pass in enumerate(confirm_results or []):
+        add_seq = 0
+        for el in confirm_pass or []:
+            eid = (el.get("element_id") or "").strip()
+            if eid and eid in by_id:
+                changed = []
+                for f in _ROSTER_AUTHORITATIVE_FIELDS:
+                    if _merge_element_field(by_id[eid], el, f,
+                                            prefer_new=False):
+                        changed.append(f)
+                for f in _CONFIRM_AUTHORITATIVE_FIELDS:
+                    if _merge_element_field(by_id[eid], el, f,
+                                            prefer_new=True):
+                        changed.append(f)
+                if changed:
+                    audit.append({"kind": "confirm_update",
+                                  "element_id": eid,
+                                  "pass": pass_idx,
+                                  "fields": changed})
+                continue
+            fp = _fingerprint(el)
+            if fp in seen_fingerprints:
+                audit.append({"kind": "deduped_addition",
+                              "name": el.get("name", "(unnamed)"),
+                              "pass": pass_idx,
+                              "matched_existing": seen_fingerprints[fp]})
+                continue
+            add_seq += 1
+            new_eid = f"auto_C{pass_idx + 1}_{add_seq}"
+            new_el = dict(el, element_id=new_eid)
+            by_id[new_eid] = new_el
+            seen_fingerprints[fp] = new_eid
+            audit.append({"kind": "confirm_addition",
+                          "element_id": new_eid,
+                          "pass": pass_idx,
+                          "name": new_el.get("name", "(unnamed)")})
+
+    return list(by_id.values()), audit
+
+
+# Fields persisted in the roster JSON sent to confirm passes. Keeps the
+# payload small (skip notes / cubic_* / raw model output) while preserving
+# every field needed to match a section drawing back to its roster row.
+_ROSTER_JSON_FIELDS = ("element_id", "name", "category", "geometry_type",
+                       "width_ft", "length_ft", "depth_ft", "qty",
+                       "d_min", "d_max", "radius_ft")
+
+
+def _roster_json(elements):
+    """Compact JSON view of the roster for inclusion in confirm-pass prompts."""
+    return json.dumps([
+        {k: el.get(k) for k in _ROSTER_JSON_FIELDS if el.get(k) is not None}
+        for el in elements or []
+    ], indent=2)
+
+
+def _build_pass_user_content(prompt_text, images, pass_intro,
+                             role_specific_instructions, filename,
+                             lessons_section):
+    """Assemble the user-message content for one extraction pass.
+
+    Carries the full critical-rules block, category list, and geometry pin
+    on every pass — the accuracy constraint says don't trade those for
+    cost. `pass_intro` and `role_specific_instructions` vary per pass; the
+    rest is identical to the single-call prompt.
+    """
+    categories_list = ", ".join(f'"{c}"' for c in CONCRETE_CATEGORIES)
+    body = f"""{pass_intro}
+{lessons_section}
+CRITICAL RULES (validated from expert human corrections — follow exactly, in addition to the concrete-takeoff skill workflow):
+1. CONCRETE ONLY — DO NOT include electrical, plumbing, mechanical, HVAC, structural steel, wood framing, drywall, finishes, or any non-concrete material as elements. If a piece of equipment sits on a concrete pad, include ONLY the pad (category "Equipment Pads"), not the equipment.
+2. SLOPED / TAPERED SLAB VOLUMES: Any sump, pit, or base slab described with a percentage slope is a wedge-shaped concrete element that must be computed as a SEPARATE, POSITIVE line item using: V = 0.5 × (h_start + h_end) × width × length. Do NOT treat it as a simple deduction.
+3. MULTIPLE ROOF SLAB SECTIONS: If the roof slab plan or sections show different annotated thicknesses for different zones, extract EACH zone as its own element with its correct depth.
+4. INTERIOR WALL THICKNESS: Interior dividing walls are frequently thinner than perimeter walls. Always look for an explicit dimension callout on the interior wall — do NOT default to the perimeter wall thickness.
+5. Cross-check dimensions with other sheets to confirm the correct measurement before going to calculations.
+
+CATEGORY FIELD (REQUIRED) — every element you return MUST carry one of these category strings, chosen by what the element IS in construction terms:
+{categories_list}
+If you cannot avoid extracting a non-concrete item, set its category to "Non-Concrete" so the server can drop it cleanly.
+
+GEOMETRY & ELEMENT-ID FIELDS (REQUIRED) — per SKILL.md Step 2.5:
+- element_id: every physical element gets a stable unique ID (F1, F2, W1, S1, C1, …); the SAME ID must identify that element across plan, schedule, and section sheets.
+- geometry_type: one of RECT_PRISM, TRAPEZOIDAL_PRISM, STEPPED_PRISM, TAPERED_WALL, CYLINDER, FRUSTUM, CUSTOM.
+- d_min / d_max for TRAPEZOIDAL_PRISM and TAPERED_WALL; radius_ft for CYLINDER / FRUSTUM.
+
+CRITICAL — width_ft, length_ft, and depth_ft MUST always be populated so that width × length × depth × qty equals the element's TRUE volume, for EVERY geometry_type. geometry_type / d_min / d_max / radius_ft are metadata only — the server computes volume from width × length × depth × qty.
+- TRAPEZOIDAL_PRISM (sloped slab): set depth_ft to the volume-effective average 0.5 × (d_min + d_max); width_ft and length_ft are plan dimensions.
+- TAPERED_WALL (battered wall): set width_ft to the volume-effective average 0.5 × (d_min + d_max); length_ft is the wall run, depth_ft is the wall height.
+- CYLINDER / FRUSTUM (round): set width_ft and length_ft so their product equals π × radius², depth_ft = height.
+- STEPPED_PRISM / CUSTOM: emit one RECT_PRISM row per rectangular sub-shape, OR one row whose depth_ft = total volume ÷ (width_ft × length_ft).
+
+HOW THE DRAWINGS ARE PROVIDED: Drawing sheets are attached as images. Tiles with the same page number belong to ONE physical sheet — reassemble them in your mind before reading dimensions. Adjacent tiles overlap, so the same element / callout can appear in two neighbors — count each physical element ONLY ONCE.
+
+Below is the extracted text from the drawings (page markers included):
+
+<drawings>
+{prompt_text}
+</drawings>
+
+{role_specific_instructions}"""
+
+    if images:
+        user_content = [{"type": "text", "text": body}]
+        for img in images:
+            if img.get("kind") == "tile" and img["rows"] * img["cols"] > 1:
+                label = (f"\n[Page {img['page']} — tile row {img['row']} of "
+                         f"{img['rows']}, col {img['col']} of {img['cols']}; "
+                         f"high-resolution, tiles overlap]")
+            elif img.get("kind") == "tile":
+                label = f"\n[Page {img['page']} — full sheet, high-resolution]"
+            else:
+                label = (f"\n[Page {img['page']} — whole-sheet overview, "
+                         f"reduced resolution]")
+            user_content.append({"type": "text", "text": label})
+            user_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img['media_type'],
+                    "data": img['data'],
+                },
+            })
+        return user_content
+    return body
+
+
+def _call_takeoff(user_content, max_tokens=12000, force_tool=False):
+    """Issue one takeoff API call and return (parsed_input, prose, truncated).
+
+    `force_tool=True` uses tool_choice={"type":"tool","name":"return_takeoff"}
+    to guarantee a structured response. Returns (None, prose, truncated) when
+    the model returned no tool call and no salvageable JSON.
+    """
+    tool_choice = ({"type": "tool", "name": "return_takeoff"} if force_tool
+                   else {"type": "auto"})
+    resp = _chat_call(
+        messages=[{"role": "user", "content": user_content}],
+        tools=[_TAKEOFF_TOOL],
+        tool_choice=tool_choice,
+        max_tokens=max_tokens,
+    )
+    prose = "".join(getattr(b, "text", "") for b in resp.content)
+    truncated = getattr(resp, "stop_reason", None) == "max_tokens"
+    tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
+    if tool_block:
+        return tool_block.input, prose, truncated
+    return _parse_json_block(prose), prose, truncated
+
+
+def _extract_multi_pass(pdf_text, vision_plan, filename):
+    """Fix 1 multi-pass extraction.
+
+    Pass 1 (serial) reads the roster sheets and warms the SKILL cache. Pass
+    2…N run concurrently (bounded by `_API_CALL_SEMAPHORE`), each receiving
+    the roster JSON and a batch of confirm-sheet tiles. Reduce merges all
+    pass outputs via `_merge_elements`; the existing verifier pipeline runs
+    on the merged list unchanged.
+
+    Falls back to the single-call path if Pass 1 fails or returns nothing.
+    """
+    roster_images = vision_plan.get("roster") or []
+    confirm_batches = vision_plan.get("confirm_batches") or []
+
+    if len(pdf_text) > MAX_PDF_CHARS:
+        head = pdf_text[: int(MAX_PDF_CHARS * 0.8)]
+        tail = pdf_text[-int(MAX_PDF_CHARS * 0.2):]
+        prompt_text = f"{head}\n\n[... middle truncated ...]\n\n{tail}"
+    else:
+        prompt_text = pdf_text
+
+    lessons_block = format_lessons_for_prompt()
+    lessons_section = f"\n{lessons_block}\n" if lessons_block else ""
+
+    roster_intro = (
+        f"Analyzing a PDF of construction drawings: {filename}\n\n"
+        f"This is the ROSTER PASS — you are reading the PLAN and SCHEDULE "
+        f"sheets. Enumerate EVERY concrete element you can see, with a "
+        f"stable element_id (F1, F2, W1, S1, …), category, geometry_type, "
+        f"plan dimensions (width_ft, length_ft), and qty. For depths / "
+        f"heights / thicknesses you cannot read in the plan or schedule, "
+        f"use a reasonable construction default and add 'provisional' to "
+        f"the notes — confirm passes will refine them from section "
+        f"drawings."
+    )
+    roster_instructions = (
+        "Work through SKILL Steps 1, 2, and 2.5 in prose first, then call "
+        "return_takeoff. Include cubic_feet and cubic_yards based on the "
+        "best dimensions you have; the server recomputes volumes from "
+        "width × length × depth × qty."
+    )
+
+    roster_content = _build_pass_user_content(
+        prompt_text, roster_images, roster_intro, roster_instructions,
+        filename, lessons_section)
+
+    try:
+        roster_parsed, roster_prose, roster_trunc = _call_takeoff(
+            roster_content, max_tokens=16000, force_tool=False)
+    except Exception as e:
+        app.logger.warning("Roster pass failed: %s — falling back to "
+                           "single-call.", e)
+        return None
+    if not (roster_parsed or {}).get("elements"):
+        # Retry once with forced tool, then give up to single-call fallback.
+        try:
+            roster_parsed, roster_prose, roster_trunc = _call_takeoff(
+                roster_content, max_tokens=12000, force_tool=True)
+        except Exception as e:
+            app.logger.warning("Roster retry failed: %s", e)
+            return None
+    if not (roster_parsed or {}).get("elements"):
+        app.logger.warning("Roster pass returned no elements; falling back.")
+        return None
+
+    roster_elements = roster_parsed.get("elements") or []
+
+    confirm_results = []
+    truncated_any = roster_trunc
+    if confirm_batches:
+        roster_json = _roster_json(roster_elements)
+        confirm_intro_tmpl = (
+            f"Analyzing a PDF of construction drawings: {filename}\n\n"
+            f"This is a CONFIRM PASS — you are reading SECTION / DETAIL "
+            f"sheets to refine depths, heights, thicknesses, and geometry "
+            f"for elements identified by the plan/schedule roster. You may "
+            f"also find concrete elements that the roster missed (e.g. "
+            f"interior walls or sumps visible only in section)."
+        )
+        confirm_instructions = (
+            f"CURRENT ROSTER (from Pass 1; JSON):\n"
+            f"<roster>\n{roster_json}\n</roster>\n\n"
+            f"For elements in the roster whose depths/heights/thicknesses "
+            f"you can read in the attached sections, return an updated "
+            f"element with the SAME element_id and the corrected depth_ft, "
+            f"d_min/d_max, geometry_type, radius_ft, and notes — width_ft/"
+            f"length_ft/qty should match the roster.\n\n"
+            f"For NEW concrete elements only visible in section that are "
+            f"NOT in the roster, return them with any element_id you like "
+            f"(the server will assign a final unique ID).\n\n"
+            f"Do NOT return roster elements you are not updating, and do "
+            f"NOT duplicate elements you can see are already in the "
+            f"roster. Call return_takeoff with only the updated and "
+            f"newly-added elements."
+        )
+
+        max_workers = max(1, min(_API_CALL_CONCURRENCY, len(confirm_batches)))
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers) as ex:
+            futures = []
+            for batch in confirm_batches:
+                batch_content = _build_pass_user_content(
+                    prompt_text, batch, confirm_intro_tmpl,
+                    confirm_instructions, filename, lessons_section)
+                futures.append(ex.submit(_call_takeoff, batch_content,
+                                          12000, True))
+            for fut in futures:
+                try:
+                    parsed, _prose, trunc = fut.result()
+                    truncated_any = truncated_any or trunc
+                    confirm_results.append(
+                        (parsed or {}).get("elements") or [])
+                except Exception as e:
+                    app.logger.warning("Confirm pass failed: %s", e)
+                    confirm_results.append([])
+
+    merged_elements, merge_audit = _merge_elements(roster_elements,
+                                                    confirm_results)
+
+    parsed = {
+        "elements": merged_elements,
+        "summary": dict((roster_parsed or {}).get("summary") or {}),
+    }
+    return _finalize_takeoff_result(
+        parsed, roster_prose, truncated_any,
+        multi_pass_meta={
+            "applied": True,
+            "roster_count": len(roster_elements),
+            "confirm_pass_count": len(confirm_results),
+            "merge_audit": merge_audit,
+        })
+
+
+def _finalize_takeoff_result(parsed, prose_response, truncated,
+                              multi_pass_meta=None):
+    """Run the shared verifier / grouping / sanity-check pipeline on a parsed
+    takeoff and assemble the final response dict. Used by both the single-call
+    and multi-pass paths so the response shape is identical."""
+    audit = _verify_element_volumes(parsed.get("elements") or [])
+    kept, dropped, by_category = _filter_and_group_elements(
+        parsed.get("elements") or [])
+    parsed["elements"] = kept
+    geometry_warnings = _geometric_sanity_checks(kept)
+
+    total_cf = 0.0
+    total_cy = 0.0
+    for el in kept:
+        try:
+            total_cf += float(el.get("cubic_feet") or 0)
+            total_cy += float(el.get("cubic_yards") or 0)
+        except (TypeError, ValueError):
+            pass
+    parsed.setdefault("summary", {})
+    parsed["summary"]["total_cubic_feet"] = round(total_cf, 2)
+    parsed["summary"]["total_cubic_yards"] = round(total_cy, 2)
+    parsed["summary"]["by_category"] = by_category
+    parsed["summary"]["verification"] = {
+        "applied": True,
+        "waste_factor": WASTE_FACTOR,
+        "drift_threshold_pct": VOLUME_DRIFT_THRESHOLD * 100,
+        "overrides": audit,
+        "override_count": len(audit),
+        "non_concrete_dropped": dropped,
+        "non_concrete_dropped_count": len(dropped),
+        "geometry_warnings": geometry_warnings,
+        "geometry_warning_count": len(geometry_warnings),
+    }
+    if multi_pass_meta is not None:
+        parsed["summary"]["multi_pass"] = multi_pass_meta
+    if truncated:
+        parsed["summary"]["truncated"] = True
+        warn = ("WARNING: the model response hit its max_tokens limit, so "
+                "this takeoff may be incomplete. Re-run to confirm.")
+        if isinstance(parsed["summary"].get("assumptions"), list):
+            parsed["summary"]["assumptions"].append(warn)
+        else:
+            parsed["summary"]["assumptions"] = [warn]
+    if geometry_warnings:
+        gwarn = (f"WARNING: {len(geometry_warnings)} geometric sanity "
+                 f"check(s) flagged this takeoff as possibly over-counted "
+                 f"or misread — see verification.geometry_warnings.")
+        if isinstance(parsed["summary"].get("assumptions"), list):
+            parsed["summary"]["assumptions"].append(gwarn)
+        else:
+            parsed["summary"]["assumptions"] = [gwarn]
+    if not parsed.get("elements") and prose_response:
+        parsed["summary"]["analysis"] = prose_response
+    return parsed
+
+
+def extract_quantities_with_claude(pdf_text, page_images, filename,
+                                    vision_plan=None):
     """Single-call analysis: identify elements, compute volumes, return data.
 
     Claude identifies every concrete element, calculates each volume, and
@@ -803,6 +1745,21 @@ def extract_quantities_with_claude(pdf_text, page_images, filename):
             "ANTHROPIC_API_KEY is not set. Create a .env file with "
             "ANTHROPIC_API_KEY=sk-ant-... or export it in your shell."
         )
+
+    # If the upload route built a multi-pass plan from triage, try it
+    # first. _extract_multi_pass returns None on any failure (roster
+    # pass empty, triage was useless, etc.) so we fall through to the
+    # single-call path using page_images as a complete render set.
+    if vision_plan and (vision_plan.get("roster")
+                        or vision_plan.get("confirm_batches")):
+        try:
+            mp_result = _extract_multi_pass(pdf_text, vision_plan, filename)
+        except Exception as e:
+            app.logger.warning("Multi-pass extraction errored: %s — "
+                                "falling back to single-call.", e)
+            mp_result = None
+        if mp_result is not None:
+            return mp_result
 
     has_text = pdf_text.strip() and len(pdf_text.strip()) >= 50
     has_images = bool(page_images)
@@ -833,29 +1790,10 @@ def extract_quantities_with_claude(pdf_text, page_images, filename):
     lessons_block = format_lessons_for_prompt()
     lessons_section = f"\n{lessons_block}\n" if lessons_block else ""
 
-    # Build the system prompt: the concrete-takeoff skill defines the
-    # professional workflow; lessons add validated human corrections on top.
-    system_prompt = (
-        "You are a construction quantity takeoff specialist. Follow the "
-        "concrete-takeoff skill below for the full workflow, formulas, "
-        "defaults, and quality checks.\n\n"
-        f"{SKILL_PROMPT}"
-    ) if SKILL_PROMPT else (
-        "You are a construction quantity takeoff specialist."
-    )
-
-    # Send the system prompt as a cacheable block. It is byte-identical on
-    # every upload (and on the retry call below), so this cache_control
-    # breakpoint lets the API serve the system prompt — and the return_takeoff
-    # tool schema, which renders just before it — at ~10% cost on any call
-    # within the 5-minute cache window. The drawing tiles deliberately get no
-    # breakpoint: they are unique per upload, so caching them would only pay
-    # the cache-write premium with nothing to read it back.
-    system_blocks = [{
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": {"type": "ephemeral"},
-    }]
+    # System prompt (SKILL + role) is built and cached centrally by
+    # _chat_call/_system_blocks — no per-request reconstruction needed.
+    # The cache_control breakpoint lives on the SKILL block in _system_blocks
+    # so every call inside the 5-minute window reads the prefix at ~10% cost.
 
     categories_list = ", ".join(f'"{c}"' for c in CONCRETE_CATEGORIES)
     initial = f"""Analyzing a PDF of construction drawings: {filename}
@@ -871,6 +1809,18 @@ CATEGORY FIELD (REQUIRED) — every element you return MUST carry one of these c
 {categories_list}
 Group elements in this canonical order: Footings → Walls → Slab on Grade → Suspended Slab → Columns → Beams → Piers / Caissons → Equipment Pads → Sidewalks / Curbs → Stairs / Landings → Sumps / Pits → Other Concrete. If you cannot avoid extracting a non-concrete item (e.g. you misread a callout), set its category to "Non-Concrete" so the server can drop it cleanly — never assign a concrete category to a non-concrete item.
 
+GEOMETRY & ELEMENT-ID FIELDS (REQUIRED) — in addition to the SKILL.md Step 2.5 geometry classification you already perform:
+- element_id: give every physical element a stable unique ID (F1, F2, W1, S1, C1, …) and return it in the `element_id` field. One ID per physical element — the same ID must identify that element wherever it appears across plan, schedule, and section sheets.
+- geometry_type: return the Step 2.5 tag — one of RECT_PRISM, TRAPEZOIDAL_PRISM, STEPPED_PRISM, TAPERED_WALL, CYLINDER, FRUSTUM, CUSTOM.
+- d_min / d_max: for TRAPEZOIDAL_PRISM and TAPERED_WALL, return the minimum and maximum thickness in feet.
+- radius_ft: for CYLINDER and FRUSTUM, return the radius in feet.
+
+CRITICAL — width_ft, length_ft, and depth_ft MUST always be populated so that width_ft × length_ft × depth_ft × qty equals the element's TRUE volume, for EVERY geometry_type. geometry_type, d_min, d_max, and radius_ft are metadata only — the server computes volume from width × length × depth × qty, so a blank or zero dimension silently zeroes the element. Map each non-rectangular shape onto the three dimensions:
+- TRAPEZOIDAL_PRISM (sloped slab, sump floor, tapered mat): the slab THICKNESS varies — set depth_ft to the volume-effective average 0.5 × (d_min + d_max); width_ft and length_ft are the plan dimensions.
+- TAPERED_WALL (battered wall): the wall THICKNESS varies — set width_ft to the volume-effective average 0.5 × (d_min + d_max); length_ft is the wall run and depth_ft is the wall height.
+- CYLINDER / FRUSTUM (round column, pier, caisson): set width_ft and length_ft so their product equals the circular area π × radius², and depth_ft to the height — so width × length × depth = π × radius² × height.
+- STEPPED_PRISM / CUSTOM: either emit one RECT_PRISM row per rectangular sub-shape, or one row whose depth_ft = total true volume ÷ (width_ft × length_ft) so the product still equals the true volume.
+
 HOW THE DRAWINGS ARE PROVIDED: Drawing sheets are attached as images. A large sheet is sliced into a grid of overlapping high-resolution tiles, each labeled "[Page N — tile row R of …, col C of …]"; a smaller or lower-priority sheet is attached as one reduced-resolution thumbnail labeled "[Page N — whole-sheet overview …]". Every image carrying the same page number is part of ONE physical sheet — reassemble its tiles in your mind into the full sheet before reading dimensions. Because adjacent tiles overlap, the same footing, wall, column, or dimension callout can appear in two neighboring tiles — count each physical element ONLY ONCE. Pages with no attached image are represented by their extracted text only.
 
 Below is the extracted text from the drawings (page markers included):
@@ -881,9 +1831,10 @@ Below is the extracted text from the drawings (page markers included):
 
 Work through the concrete-takeoff skill in this single response, in order:
 
-STEPS 1-2 — IDENTIFY & EXTRACT (do this in prose first): Follow Step 1 (Ingest and Orient) and Step 2 (Extract Dimensions). Identify EVERY concrete structural element you can see (footings, slab on grade, walls, columns, piers, slabs on deck, equipment pads, sidewalks, driveways, sumps, sloped bases, etc.). For each, note:
-- A descriptive name and unique element ID (F1, F2, W1, S1, C1, etc.)
+STEPS 1-2.5 — IDENTIFY, EXTRACT & CLASSIFY (do this in prose first): Follow Step 1 (Ingest and Orient), Step 2 (Extract Dimensions), and Step 2.5 (Classify Geometry). Identify EVERY concrete structural element you can see (footings, slab on grade, walls, columns, piers, slabs on deck, equipment pads, sidewalks, driveways, sumps, sloped bases, etc.). For each, note:
+- A descriptive name and unique element ID (F1, F2, W1, S1, C1, etc.) — return the ID in the element_id field
 - Its concrete category from the list above
+- Its geometry_type — the Step 2.5 tag (RECT_PRISM, TRAPEZOIDAL_PRISM, STEPPED_PRISM, TAPERED_WALL, CYLINDER, FRUSTUM, or CUSTOM)
 - Width, length, depth/thickness (in feet; convert inches: 6\" = 0.5 ft)
 - Quantity if there are multiples (e.g., 9 column footings)
 - Any reinforcement / strength specs you noticed
@@ -936,14 +1887,11 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
     # no accuracy gain (Python recomputes all volumes in _verify_element_volumes
     # regardless). tool_choice="auto" lets Claude reason in prose before the
     # tool call; the retry loop below forces the tool if nothing usable returns.
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        temperature=TEMPERATURE,
-        system=system_blocks,
+    resp = _chat_call(
         messages=history,
         tools=[_TAKEOFF_TOOL],
         tool_choice={"type": "auto"},
+        max_tokens=16000,
     )
     # Join every text block so multi-block responses aren't truncated. This is
     # the reasoning Claude emitted before the tool call — kept as fallback
@@ -1018,14 +1966,11 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
                     "return an empty elements list."
                 ),
             })
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=8000,
-            temperature=TEMPERATURE,
-            system=system_blocks,
+        resp = _chat_call(
             messages=retry_messages,
             tools=[_TAKEOFF_TOOL],
             tool_choice={"type": "tool", "name": "return_takeoff"},
+            max_tokens=8000,
         )
         truncated = getattr(resp, "stop_reason", None) == "max_tokens"
         tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
@@ -1033,72 +1978,9 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
             parsed = tool_block.input
 
     if parsed:
-        # Deterministic Python recompute of every element's volume from the
-        # extracted dimensions. Replaces Claude's arithmetic (which drifts ~1%
-        # across multiple trials) with a single canonical computation. Also
-        # normalises the category field against CONCRETE_CATEGORIES.
-        audit = _verify_element_volumes(parsed.get("elements") or [])
-
-        # Drop electrical/mechanical/steel rows that snuck through and compute
-        # per-category subtotals so the UI can group the table without doing
-        # its own classification.
-        kept, dropped, by_category = _filter_and_group_elements(
-            parsed.get("elements") or []
-        )
-        parsed["elements"] = kept
-
-        # Flag elements whose extracted geometry is physically implausible
-        # (double-counted / over-decomposed) so a wrong takeoff is visible.
-        geometry_warnings = _geometric_sanity_checks(kept)
-
-        total_cf = 0.0
-        total_cy = 0.0
-        for el in kept:
-            try:
-                total_cf += float(el.get("cubic_feet") or 0)
-                total_cy += float(el.get("cubic_yards") or 0)
-            except (TypeError, ValueError):
-                pass
-        parsed.setdefault("summary", {})
-        parsed["summary"]["total_cubic_feet"] = round(total_cf, 2)
-        parsed["summary"]["total_cubic_yards"] = round(total_cy, 2)
-        parsed["summary"]["by_category"] = by_category
-        parsed["summary"]["verification"] = {
-            "applied": True,
-            "waste_factor": WASTE_FACTOR,
-            "drift_threshold_pct": VOLUME_DRIFT_THRESHOLD * 100,
-            "overrides": audit,
-            "override_count": len(audit),
-            "non_concrete_dropped": dropped,
-            "non_concrete_dropped_count": len(dropped),
-            "geometry_warnings": geometry_warnings,
-            "geometry_warning_count": len(geometry_warnings),
-        }
-        # Surface a truncated response so a cut-off takeoff is not trusted silently.
-        if truncated:
-            parsed["summary"]["truncated"] = True
-            warn = ("WARNING: the model response hit its max_tokens limit, so "
-                    "this takeoff may be incomplete. Re-run to confirm.")
-            if isinstance(parsed["summary"].get("assumptions"), list):
-                parsed["summary"]["assumptions"].append(warn)
-            else:
-                parsed["summary"]["assumptions"] = [warn]
-
-        # Surface geometry warnings the same way so the UI shows them.
-        if geometry_warnings:
-            gwarn = (f"WARNING: {len(geometry_warnings)} geometric sanity "
-                     f"check(s) flagged this takeoff as possibly over-counted "
-                     f"or misread — see verification.geometry_warnings.")
-            if isinstance(parsed["summary"].get("assumptions"), list):
-                parsed["summary"]["assumptions"].append(gwarn)
-            else:
-                parsed["summary"]["assumptions"] = [gwarn]
-
-        # When the tool returned no elements, attach the reasoning prose so
-        # the frontend parser can attempt to extract rows from it.
-        if not parsed.get("elements") and prose_response:
-            parsed["summary"]["analysis"] = prose_response
-        return parsed
+        # Deterministic Python recompute + grouping + sanity checks, shared
+        # with the multi-pass path so the response shape is identical.
+        return _finalize_takeoff_result(parsed, prose_response, truncated)
 
     # Reached only if the call made no tool call and no JSON could be salvaged
     return {
@@ -1217,8 +2099,31 @@ def upload_file():
 
         try:
             pdf_text, page_texts = extract_pdf_text(save_path)
-            page_images = select_and_render_vision(save_path, page_texts)
-            result = extract_quantities_with_claude(pdf_text, page_images, filename)
+            # Try Pass 0 vision triage first when the sheet set is large
+            # enough to benefit from multi-pass. Small sets and triage
+            # failures fall back to the keyword-heuristic single-call path.
+            vision_plan = None
+            page_images = []
+            if len(page_texts) > SMALL_SET_THRESHOLD:
+                triage = triage_sheets(save_path, len(page_texts))
+                if triage:
+                    roster_images, confirm_batches = select_vision_buckets(
+                        save_path, triage, page_texts)
+                    if roster_images or confirm_batches:
+                        vision_plan = {
+                            "mode": "multi_pass",
+                            "roster": roster_images,
+                            "confirm_batches": confirm_batches,
+                            "triage": triage,
+                        }
+                        # For metrics + single-call fallback: every tile the
+                        # multi-pass plan would send, in one flat list.
+                        page_images = roster_images + [
+                            t for b in confirm_batches for t in b]
+            if vision_plan is None:
+                page_images = select_and_render_vision(save_path, page_texts)
+            result = extract_quantities_with_claude(
+                pdf_text, page_images, filename, vision_plan=vision_plan)
         finally:
             try:
                 os.remove(save_path)
