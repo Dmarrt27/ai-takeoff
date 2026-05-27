@@ -332,11 +332,89 @@ def _img_token_estimate(w, h):
 
 
 def _render_tiles(page, page_no, scale):
-    """Render one page at high resolution and slice it into overlapping tiles.
+    """Render one page's overlapping tiles via per-tile pdfium clip rendering.
+
+    Each tile is rendered directly with pdfium's `crop` parameter so the
+    full-page bitmap never materialises — a 36×24" sheet at 151 DPI would
+    otherwise allocate a ~75 MB PIL image (plus the underlying pdfium
+    bitmap), enough to push Render's 512 MB plan over the edge after the
+    accumulated base64 strings from prior pages. With clip rendering the
+    transient cost is one tile (~5 MB) regardless of sheet size.
 
     PNG is used (not JPEG) because line art has no gradients and JPEG ringing
     blurs thin dimension lines and small callout text.
     """
+    pw, ph = page.get_size()
+    # math.ceil matches pdfium's own dim computation (src_width =
+    # ceil((page_w - crop_left - crop_right) * scale)); using int() here
+    # would produce tile boxes 1 px short on each axis and shift every
+    # cropped tile relative to where it would have appeared in the old
+    # full-page-then-crop path.
+    img_w = math.ceil(pw * scale)
+    img_h = math.ceil(ph * scale)
+    boxes, rows, cols = _tile_boxes(img_w, img_h)
+    # Render each tile slightly larger than its target, then PIL-crop the
+    # padding off. Pdfium's anti-aliasing along a clip boundary is subtly
+    # different from rasterising the full page and then cropping, so a
+    # glyph or line whose stroke straddles a tile seam would otherwise
+    # land with ~5 px of AA-diff pixels at the cropped tile's edge. The
+    # pad fully contains pdfium's AA halo, so the final cropped tile is
+    # pixel-equivalent to the old full-page-render path — no chance of a
+    # dimension callout being misread at a boundary.
+    pad_px = 16
+    tiles = []
+    for (x0, y0, x1, y1, r, c) in boxes:
+        # Pad inward toward the page interior only; at an actual page
+        # edge there's no neighbour, so no AA boundary, and no padding.
+        pl = pad_px if x0 > 0 else 0
+        pt = pad_px if y0 > 0 else 0
+        pr = pad_px if x1 < img_w else 0
+        pb = pad_px if y1 < img_h else 0
+        # Convert the padded pixel-space tile box into pdfium's PDF-point
+        # crop tuple (left, bottom, right, top) — amount to cut from each
+        # side. Image Y grows downward, PDF Y grows upward, so the top of
+        # the tile in image coords is a cut from the TOP of the page in
+        # PDF coords (and vice versa for the bottom).
+        crop = (
+            max(0.0, (x0 - pl) / scale),
+            max(0.0, (img_h - (y1 + pb)) / scale),
+            max(0.0, (img_w - (x1 + pr)) / scale),
+            max(0.0, (y0 - pt) / scale),
+        )
+        bitmap = page.render(scale=scale, crop=crop)
+        try:
+            pil = bitmap.to_pil()
+            if pil.mode != "RGB":
+                pil = pil.convert("RGB")
+        finally:
+            bitmap.close()
+        if pl or pt or pr or pb:
+            pil = pil.crop((pl, pt, pil.width - pr, pil.height - pb))
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        pil.close()
+        tiles.append({
+            "page": page_no, "kind": "tile",
+            "row": r + 1, "col": c + 1, "rows": rows, "cols": cols,
+            "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "media_type": "image/png",
+        })
+    return tiles
+
+
+def _render_overview(page, page_no):
+    """Render one page as a single reduced-resolution overview thumbnail.
+
+    Renders at the target output scale directly so a full-resolution bitmap
+    is never materialised — the original code rendered at scale 2.0 (e.g.
+    5184×3456 px ≈ 70 MB for a 36×24" sheet) just to PIL-resize it down to
+    1024 px afterwards, which OOM'd on 512 MB hosts.
+    """
+    pw, ph = page.get_size()
+    long_pt = max(pw, ph) or 1.0
+    # Match prior behaviour: target ~TILE_MAX_PX on the long edge, capped
+    # so tiny pages don't get upsampled beyond the original render scale.
+    scale = min(2.0, TILE_MAX_PX / long_pt)
     bitmap = page.render(scale=scale)
     try:
         pil = bitmap.to_pil()
@@ -344,34 +422,6 @@ def _render_tiles(page, page_no, scale):
             pil = pil.convert("RGB")
     finally:
         bitmap.close()
-    boxes, rows, cols = _tile_boxes(pil.width, pil.height)
-    tiles = []
-    for (x0, y0, x1, y1, r, c) in boxes:
-        buf = io.BytesIO()
-        pil.crop((x0, y0, x1, y1)).save(buf, format="PNG")
-        tiles.append({
-            "page": page_no, "kind": "tile",
-            "row": r + 1, "col": c + 1, "rows": rows, "cols": cols,
-            "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
-            "media_type": "image/png",
-        })
-    pil.close()
-    return tiles
-
-
-def _render_overview(page, page_no):
-    """Render one page as a single reduced-resolution overview thumbnail."""
-    bitmap = page.render(scale=2.0)
-    try:
-        pil = bitmap.to_pil()
-        if pil.mode != "RGB":
-            pil = pil.convert("RGB")
-    finally:
-        bitmap.close()
-    w, h = pil.size
-    if max(w, h) > TILE_MAX_PX:
-        ratio = TILE_MAX_PX / max(w, h)
-        pil = pil.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
     buf = io.BytesIO()
     pil.save(buf, format="JPEG", quality=85)
     pil.close()
@@ -418,8 +468,8 @@ def select_and_render_vision(pdf_path, page_texts):
                         scale = TILE_RENDER_SCALE
                         if long_pt * scale > MAX_RENDER_PX:
                             scale = MAX_RENDER_PX / long_pt
-                        boxes, _, _ = _tile_boxes(int(pw * scale),
-                                                  int(ph * scale))
+                        boxes, _, _ = _tile_boxes(math.ceil(pw * scale),
+                                                  math.ceil(ph * scale))
                         tile_cost = sum(
                             _img_token_estimate(x1 - x0, y1 - y0)
                             for (x0, y0, x1, y1, _, _) in boxes
@@ -696,8 +746,8 @@ def _render_tiles_for_pages(pdf_path, pages_1based, token_budget,
                         scale = TILE_RENDER_SCALE
                         if long_pt * scale > MAX_RENDER_PX:
                             scale = MAX_RENDER_PX / long_pt
-                        boxes, _, _ = _tile_boxes(int(pw * scale),
-                                                   int(ph * scale))
+                        boxes, _, _ = _tile_boxes(math.ceil(pw * scale),
+                                                   math.ceil(ph * scale))
                         tile_cost = sum(
                             _img_token_estimate(x1 - x0, y1 - y0)
                             for (x0, y0, x1, y1, _, _) in boxes
@@ -1643,6 +1693,15 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
 
     roster_elements = roster_parsed.get("elements") or []
 
+    # Pass 1 is done — confirm passes only need the roster ELEMENT LIST
+    # (serialized to JSON below), not the roster images. Drop the base64
+    # strings now (typically 30–50 MB) so the parallel confirm fan-out
+    # doesn't peak with both roster + confirm payloads resident at once.
+    roster_images.clear()
+    if isinstance(vision_plan, dict):
+        vision_plan["roster"] = []
+    gc.collect()
+
     confirm_results = []
     truncated_any = roster_trunc
     if confirm_batches:
@@ -1673,16 +1732,26 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
         )
 
         max_workers = max(1, min(_API_CALL_CONCURRENCY, len(confirm_batches)))
+        # Free each batch's image data the moment its confirm pass returns
+        # (via as_completed) instead of waiting for all batches to finish.
+        # Caps in-flight memory at roughly max_workers × batch payload
+        # instead of len(confirm_batches) × batch payload.
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers) as ex:
-            futures = []
+            future_to_batch = {}
             for batch in confirm_batches:
                 batch_content = _build_pass_user_content(
                     prompt_text, batch, confirm_intro_tmpl,
                     confirm_instructions, filename, lessons_section)
-                futures.append(ex.submit(_call_takeoff, batch_content,
-                                          12000, True))
-            for fut in futures:
+                fut = ex.submit(_call_takeoff, batch_content, 12000, True)
+                future_to_batch[fut] = batch
+            # Drop the local refs to the last loop iteration's content/batch
+            # so the only remaining strong refs are the executor's WorkItems
+            # (released as each future runs) and future_to_batch (popped in
+            # the as_completed loop below).
+            del batch_content, batch
+            for fut in concurrent.futures.as_completed(future_to_batch):
+                done_batch = future_to_batch.pop(fut)
                 try:
                     parsed, _prose, trunc = fut.result()
                     truncated_any = truncated_any or trunc
@@ -1691,6 +1760,8 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
                 except Exception as e:
                     app.logger.warning("Confirm pass failed: %s", e)
                     confirm_results.append([])
+                done_batch.clear()
+                gc.collect()
 
     merged_elements, merge_audit = _merge_elements(roster_elements,
                                                     confirm_results)
@@ -1796,6 +1867,14 @@ def extract_quantities_with_claude(pdf_text, page_images, filename,
             mp_result = None
         if mp_result is not None:
             return mp_result
+        # Multi-pass failed before clearing its image refs (clearing only
+        # happens after the roster pass succeeds), so vision_plan still
+        # holds every rendered tile. Rebuild a flat list for the single-
+        # call fallback so we don't drop into a text-only path.
+        if not page_images:
+            page_images = list(vision_plan.get("roster") or [])
+            for _b in vision_plan.get("confirm_batches") or []:
+                page_images.extend(_b)
 
     has_text = pdf_text.strip() and len(pdf_text.strip()) >= 50
     has_images = bool(page_images)
@@ -2140,6 +2219,8 @@ def upload_file():
             # failures fall back to the keyword-heuristic single-call path.
             vision_plan = None
             page_images = []
+            rendered_pages_count = 0
+            rendered_tiles_count = 0
             if len(page_texts) > SMALL_SET_THRESHOLD:
                 triage = triage_sheets(save_path, len(page_texts))
                 if triage:
@@ -2157,12 +2238,34 @@ def upload_file():
                             "confirm_batches": confirm_batches,
                             "triage": triage,
                         }
-                        # For metrics + single-call fallback: every tile the
-                        # multi-pass plan would send, in one flat list.
-                        page_images = roster_images + [
-                            t for b in confirm_batches for t in b]
+                        # Capture metrics as primitives now so we don't
+                        # need to keep a parallel flat list of every tile
+                        # ref. Multi-pass clears image data between passes
+                        # to bound peak memory; a parallel flat list here
+                        # would pin every base64 string in RAM through the
+                        # whole call and re-OOM the 512MB host.
+                        pages_seen = {im['page'] for im in roster_images}
+                        for _b in confirm_batches:
+                            for _im in _b:
+                                pages_seen.add(_im['page'])
+                        rendered_pages_count = len(pages_seen)
+                        rendered_tiles_count = (
+                            sum(1 for im in roster_images
+                                if im.get('kind') == 'tile')
+                            + sum(1 for _b in confirm_batches for _im in _b
+                                  if _im.get('kind') == 'tile')
+                        )
+                        del pages_seen
+                        # page_images stays empty for the multi-pass path;
+                        # the single-call fallback inside
+                        # extract_quantities_with_claude rebuilds a flat
+                        # list from vision_plan on demand if it has to.
             if vision_plan is None:
                 page_images = select_and_render_vision(save_path, page_texts)
+                rendered_pages_count = len(
+                    {im['page'] for im in page_images})
+                rendered_tiles_count = sum(
+                    1 for im in page_images if im.get('kind') == 'tile')
             result = extract_quantities_with_claude(
                 pdf_text, page_images, filename, vision_plan=vision_plan)
         finally:
@@ -2174,14 +2277,13 @@ def upload_file():
             # OS so the next request starts fresh instead of inheriting peak.
             gc.collect()
 
-        tiles = sum(1 for im in page_images if im.get('kind') == 'tile')
         return jsonify({
             'success': True,
             'filename': filename,
             'pdf_page_count': len(page_texts),
             'pages_text_chars': len(pdf_text),
-            'vision_pages_rendered': len({im['page'] for im in page_images}),
-            'vision_tiles_rendered': tiles,
+            'vision_pages_rendered': rendered_pages_count,
+            'vision_tiles_rendered': rendered_tiles_count,
             'data': result,
         })
     except Exception as e:
