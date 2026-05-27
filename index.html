@@ -1136,8 +1136,7 @@
 </div>
 
 <script>
-    const RENDER_BACKEND = 'https://ai-takeoff-api.onrender.com';
-    const API_BASE = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://localhost:5001' : RENDER_BACKEND;
+    const API_BASE = 'https://ai-takeoff-api.onrender.com';
 
     // Canonical concrete categories (must match CONCRETE_CATEGORIES in app.py).
     // Order matches the per-category breakdown tile order.
@@ -1236,7 +1235,7 @@
         const formData = new FormData(); formData.append('file', file);
         let response;
         try { response = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData }); }
-        catch(err) { loadingSection.style.display='none'; showMessage(`Could not reach the backend. Is the Flask server running? (${err.message})`,'error'); return; }
+        catch(err) { loadingSection.style.display='none'; showMessage(`Could not reach the backend (Render). It may be cold-starting — try again in ~30s. (${err.message})`,'error'); return; }
         let payload;
         try { payload = await response.json(); }
         catch(e) { loadingSection.style.display='none'; showMessage(`Server returned a non-JSON response (HTTP ${response.status}).`,'error'); return; }
