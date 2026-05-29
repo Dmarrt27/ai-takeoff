@@ -103,7 +103,8 @@ When locking CORS down, allow BOTH `https://martinezwesternaitakeoff.com` and `h
 
 - **Render free-tier cold start:** 15 min idle → service sleeps → next request takes 30-60s to wake. Browser users see hangs or "Failed to fetch." If this becomes a problem, either set up a keep-warm cron (ping `/api/health` every 14 min) or upgrade to the $7/mo plan.
 - **Upload bandwidth:** Render free tier transfers files at ~100 KB/s. A 12MB PDF takes ~2 min just to upload. This eats into the request timeout budget. Long-term fix: presigned S3 upload from the browser, then send only the URL to `/api/upload`.
-- **Browsers may surface "Failed to fetch" with no useful console error** when Render's edge serves a 500/502 without CORS headers. Always check Network tab in DevTools — if you see a response with no `Access-Control-Allow-Origin`, the server died during the request (timeout, OOM, crash).
+- **Browsers may surface "Failed to fetch" with no useful console error** when Render's edge serves a 500/502 without CORS headers. Always check Network tab in DevTools — if you see a response with no `Access-Control-Allow-Origin`, the server died during the request (timeout, OOM, crash). A large drawing set (~100MB+) OOMing the worker presents exactly this way — confirm via the Render instance log ("Ran out of memory").
+- **Vision tiles render lazily (multi-pass path):** `select_vision_buckets` rasterises only the roster sheets up front; confirm sheets are returned as unrendered PLAN dicts (`{page, scale, mode, tile_count}`) and `_extract_multi_pass` rasterises each batch inside its worker right before the call, freeing it as the future completes. This bounds peak base64 to roster + ~`API_CALL_CONCURRENCY` in-flight confirm batches instead of every tile at once — the peak that OOM'd the 512MB plan on 100MB+ sets. If you ever need *all* tiles resident again, use `_plan_tiles_for_pages` + `_render_plans` together.
 
 ## Workflow rules
 

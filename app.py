@@ -687,49 +687,59 @@ def _bucket_pages_by_triage(page_count, triage):
     return roster_pages, confirm_pages
 
 
-def _pack_confirm_batches(by_page, confirm_pages, batch_cap):
-    """Pure: pack per-page tile lists into batches under batch_cap tiles each.
+def _pack_confirm_plan_batches(plans, batch_cap):
+    """Pure: pack per-page render PLANS into batches under batch_cap tiles each.
 
     A page whose tile count alone exceeds batch_cap becomes its own oversize
     batch — splitting one sheet's tiles across two confirm calls would break
     the "same page = one sheet" rule the model uses to reassemble overlapping
     tiles. Token / image budget enforcement happens upstream in
-    _render_tiles_for_pages so peak RAM stays bounded.
+    _plan_tiles_for_pages so peak RAM stays bounded.
+
+    Operates on unrendered plan dicts (not base64 tiles) so confirm sheets can
+    be rasterised lazily, one batch at a time, right before each confirm call.
     """
     batches = []
     current = []
-    for page in confirm_pages:
-        tiles = by_page.get(page, [])
-        if not tiles:
+    current_tiles = 0
+    for plan in plans:
+        tiles = plan.get("tile_count", 0)
+        if tiles <= 0:
             continue
-        if current and len(current) + len(tiles) > batch_cap:
+        if current and current_tiles + tiles > batch_cap:
             batches.append(current)
             current = []
-        current.extend(tiles)
+            current_tiles = 0
+        current.append(plan)
+        current_tiles += tiles
     if current:
         batches.append(current)
     return batches
 
 
-def _render_tiles_for_pages(pdf_path, pages_1based, token_budget,
-                             image_budget):
-    """Render given 1-based pages as high-res tiles under a token + image
-    budget, in a single PDF open.
+def _plan_tiles_for_pages(pdf_path, pages_1based, token_budget, image_budget):
+    """Plan how each given 1-based page renders under a token + image budget,
+    WITHOUT materialising any bitmaps.
 
-    Mirrors the per-page budgeting in select_and_render_vision so peak RAM
-    on a 512MB host stays the same as the single-call path:
+    Reads only page sizes (cheap) to decide, per page, whether it gets
+    high-res tiles, a single overview thumbnail, or nothing — mirroring the
+    budgeting in select_and_render_vision so the lazy path selects exactly the
+    same pages as the old eager path:
     - if the page's full tile set fits in remaining budget → high-res tiles;
     - else if a single overview thumbnail fits → overview only;
     - else → skipped (model reads the page via extracted text).
 
-    Once the budget is exhausted the loop exits — no further bitmaps are
-    materialised. Returns (by_page, used_tokens, used_images).
+    Once the budget is exhausted the loop exits. Returns (plans, used_tokens,
+    used_images) where plans is a list of dicts in page order:
+      {page, scale, mode: 'tiles'|'overview', tile_count}
+    Pages that render nothing are omitted. Pass the plans to _render_plans to
+    materialise the bitmaps when (and only when) they are about to be sent.
     """
-    by_page = {}
+    plans = []
     used_tokens = 0
     used_images = 0
     if not pages_1based or image_budget <= 0 or token_budget <= 0:
-        return by_page, 0, 0
+        return plans, 0, 0
     pdf = pdfium.PdfDocument(pdf_path)
     try:
         for page_no in pages_1based:
@@ -737,81 +747,116 @@ def _render_tiles_for_pages(pdf_path, pages_1based, token_budget,
                 break
             i = page_no - 1
             try:
-                with _RENDER_LOCK:
-                    page = pdf[i]
-                    try:
-                        pw, ph = page.get_size()
-                        long_pt = max(pw, ph) or 1.0
-                        short_pt = min(pw, ph)
-                        scale = TILE_RENDER_SCALE
-                        if long_pt * scale > MAX_RENDER_PX:
-                            scale = MAX_RENDER_PX / long_pt
-                        boxes, _, _ = _tile_boxes(math.ceil(pw * scale),
-                                                   math.ceil(ph * scale))
-                        tile_cost = sum(
-                            _img_token_estimate(x1 - x0, y1 - y0)
-                            for (x0, y0, x1, y1, _, _) in boxes
-                        )
-                        ov_long = min(long_pt * 2.0, TILE_MAX_PX)
-                        ov_cost = _img_token_estimate(
-                            ov_long, ov_long * short_pt / long_pt)
+                page = pdf[i]
+                try:
+                    pw, ph = page.get_size()
+                finally:
+                    page.close()
+                long_pt = max(pw, ph) or 1.0
+                short_pt = min(pw, ph)
+                scale = TILE_RENDER_SCALE
+                if long_pt * scale > MAX_RENDER_PX:
+                    scale = MAX_RENDER_PX / long_pt
+                boxes, _, _ = _tile_boxes(math.ceil(pw * scale),
+                                           math.ceil(ph * scale))
+                tile_cost = sum(
+                    _img_token_estimate(x1 - x0, y1 - y0)
+                    for (x0, y0, x1, y1, _, _) in boxes
+                )
+                ov_long = min(long_pt * 2.0, TILE_MAX_PX)
+                ov_cost = _img_token_estimate(
+                    ov_long, ov_long * short_pt / long_pt)
 
-                        if (used_images + len(boxes) <= image_budget
-                                and used_tokens + tile_cost <= token_budget):
-                            tiles = _render_tiles(page, page_no, scale)
-                            by_page[page_no] = tiles
-                            used_tokens += tile_cost
-                            used_images += len(tiles)
-                        elif (used_images + 1 <= image_budget
-                                and used_tokens + ov_cost <= token_budget):
-                            by_page[page_no] = [
-                                _render_overview(page, page_no)]
-                            used_tokens += ov_cost
-                            used_images += 1
+                if (used_images + len(boxes) <= image_budget
+                        and used_tokens + tile_cost <= token_budget):
+                    plans.append({"page": page_no, "scale": scale,
+                                  "mode": "tiles", "tile_count": len(boxes)})
+                    used_tokens += tile_cost
+                    used_images += len(boxes)
+                elif (used_images + 1 <= image_budget
+                        and used_tokens + ov_cost <= token_budget):
+                    plans.append({"page": page_no, "scale": scale,
+                                  "mode": "overview", "tile_count": 1})
+                    used_tokens += ov_cost
+                    used_images += 1
+                # else: page renders nothing — read via extracted text only.
+            except Exception as e:
+                app.logger.warning("Tile plan failed for page %d: %s",
+                                   page_no, e)
+    finally:
+        pdf.close()
+    return plans, used_tokens, used_images
+
+
+def _render_plans(pdf_path, plans):
+    """Materialise the bitmaps for a list of page plans, in a single PDF open.
+
+    Returns a flat list of image dicts (tiles and/or overviews) in plan order,
+    the same shape _build_pass_user_content consumes. Rendering is serialised
+    on _RENDER_LOCK so that, even when called concurrently from confirm-pass
+    workers, only one page's bitmap materialises at a time and peak RAM stays
+    bounded to the resident base64 of the plans handed in — not every confirm
+    tile in the document at once.
+    """
+    images = []
+    if not plans:
+        return images
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for plan in plans:
+            page_no = plan["page"]
+            try:
+                with _RENDER_LOCK:
+                    page = pdf[page_no - 1]
+                    try:
+                        if plan["mode"] == "tiles":
+                            images.extend(
+                                _render_tiles(page, page_no, plan["scale"]))
                         else:
-                            by_page[page_no] = []
+                            images.append(_render_overview(page, page_no))
                     finally:
                         page.close()
             except Exception as e:
                 app.logger.warning("Tile render failed for page %d: %s",
                                    page_no, e)
-                by_page.setdefault(page_no, [])
     finally:
         pdf.close()
-    return by_page, used_tokens, used_images
+    return images
 
 
 def select_vision_buckets(pdf_path, triage, page_texts):
-    """Bucket sheets by triage role, render full-res tiles per bucket within
+    """Bucket sheets by triage role and decide each sheet's render within
     VISION_TOKEN_BUDGET / MAX_VISION_IMAGES so peak RAM stays bounded.
 
     Returns (roster_images, confirm_batches):
-    - roster_images: one flat tile list — Pass 1 reads them all in one call.
-    - confirm_batches: list of tile lists, each sized to fit one confirm
-      call; confirm passes fan out one batch per call.
+    - roster_images: a flat list of rendered tiles — Pass 1 reads them all in
+      one call, so they are rasterised eagerly here.
+    - confirm_batches: a list of render-PLAN batches (NOT rendered tiles), each
+      sized to fit one confirm call. Confirm sheets are rasterised lazily by
+      _extract_multi_pass, one batch at a time, so the high-res confirm tiles
+      never all sit in RAM at once — the peak that OOM'd Render's 512MB plan on
+      large drawing sets.
 
-    Roster consumes from the global budget first (its sheets carry the
-    element list, accuracy-critical); confirm sheets share whatever
-    budget remains. Sheets dropped by the budget are read only via the
-    extracted PDF text, same fallback as the single-call path.
+    Roster consumes from the global budget first (its sheets carry the element
+    list, accuracy-critical); confirm sheets share whatever budget remains.
+    Sheets dropped by the budget are read only via the extracted PDF text, same
+    fallback as the single-call path.
     """
     n = len(page_texts)
     if not triage or n == 0:
         return [], []
     roster_pages, confirm_pages = _bucket_pages_by_triage(n, triage)
 
-    by_page_r, used_t, used_i = _render_tiles_for_pages(
+    roster_plans, used_t, used_i = _plan_tiles_for_pages(
         pdf_path, roster_pages, VISION_TOKEN_BUDGET, MAX_VISION_IMAGES)
-    roster_images = []
-    for page in roster_pages:
-        roster_images.extend(by_page_r.get(page, []))
+    roster_images = _render_plans(pdf_path, roster_plans)
 
-    by_page_c, _, _ = _render_tiles_for_pages(
+    confirm_plans, _, _ = _plan_tiles_for_pages(
         pdf_path, confirm_pages,
         max(0, VISION_TOKEN_BUDGET - used_t),
         max(0, MAX_VISION_IMAGES - used_i))
-    confirm_batches = _pack_confirm_batches(
-        by_page_c, confirm_pages, CONFIRM_BATCH_TILES)
+    confirm_batches = _pack_confirm_plan_batches(
+        confirm_plans, CONFIRM_BATCH_TILES)
     return roster_images, confirm_batches
 
 
@@ -1639,6 +1684,9 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
     """
     roster_images = vision_plan.get("roster") or []
     confirm_batches = vision_plan.get("confirm_batches") or []
+    # Path to the on-disk PDF, used to rasterise confirm batches lazily (one
+    # batch per call) rather than holding every confirm tile in RAM at once.
+    pdf_path = vision_plan.get("pdf_path")
 
     if len(pdf_text) > MAX_PDF_CHARS:
         head = pdf_text[: int(MAX_PDF_CHARS * 0.8)]
@@ -1731,27 +1779,31 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
             f"newly-added elements."
         )
 
+        def _render_and_confirm(batch_plans):
+            # Rasterise this batch's tiles only now, inside the worker, so the
+            # high-res base64 exists just for the duration of this one call —
+            # not for every confirm batch at once. _render_plans serialises on
+            # _RENDER_LOCK, so concurrent workers still materialise only one
+            # page bitmap at a time; peak resident base64 is at most
+            # max_workers in-flight batches, then it's freed as the future
+            # completes. This is the peak that OOM'd the 512MB plan.
+            batch_tiles = _render_plans(pdf_path, batch_plans)
+            content = _build_pass_user_content(
+                prompt_text, batch_tiles, confirm_intro_tmpl,
+                confirm_instructions, filename, lessons_section)
+            # content now embeds the base64; the tile list is redundant.
+            batch_tiles.clear()
+            return _call_takeoff(content, max_tokens=12000, force_tool=True)
+
         max_workers = max(1, min(_API_CALL_CONCURRENCY, len(confirm_batches)))
-        # Free each batch's image data the moment its confirm pass returns
-        # (via as_completed) instead of waiting for all batches to finish.
-        # Caps in-flight memory at roughly max_workers × batch payload
+        # Submit unrendered plan batches; each worker renders → calls → frees.
+        # In-flight memory is bounded to roughly max_workers × batch payload
         # instead of len(confirm_batches) × batch payload.
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers) as ex:
-            future_to_batch = {}
-            for batch in confirm_batches:
-                batch_content = _build_pass_user_content(
-                    prompt_text, batch, confirm_intro_tmpl,
-                    confirm_instructions, filename, lessons_section)
-                fut = ex.submit(_call_takeoff, batch_content, 12000, True)
-                future_to_batch[fut] = batch
-            # Drop the local refs to the last loop iteration's content/batch
-            # so the only remaining strong refs are the executor's WorkItems
-            # (released as each future runs) and future_to_batch (popped in
-            # the as_completed loop below).
-            del batch_content, batch
-            for fut in concurrent.futures.as_completed(future_to_batch):
-                done_batch = future_to_batch.pop(fut)
+            futures = [ex.submit(_render_and_confirm, batch)
+                       for batch in confirm_batches]
+            for fut in concurrent.futures.as_completed(futures):
                 try:
                     parsed, _prose, trunc = fut.result()
                     truncated_any = truncated_any or trunc
@@ -1760,7 +1812,6 @@ def _extract_multi_pass(pdf_text, vision_plan, filename):
                 except Exception as e:
                     app.logger.warning("Confirm pass failed: %s", e)
                     confirm_results.append([])
-                done_batch.clear()
                 gc.collect()
 
     merged_elements, merge_audit = _merge_elements(roster_elements,
@@ -2237,23 +2288,29 @@ def upload_file():
                             "roster": roster_images,
                             "confirm_batches": confirm_batches,
                             "triage": triage,
+                            # Confirm batches are unrendered plans; the
+                            # multi-pass path rasterises them lazily from this
+                            # path, one batch per call, so they never all sit
+                            # in RAM at once. The file outlives the call (it's
+                            # deleted in the finally below, after extraction).
+                            "pdf_path": save_path,
                         }
                         # Capture metrics as primitives now so we don't
                         # need to keep a parallel flat list of every tile
-                        # ref. Multi-pass clears image data between passes
-                        # to bound peak memory; a parallel flat list here
-                        # would pin every base64 string in RAM through the
-                        # whole call and re-OOM the 512MB host.
+                        # ref. roster_images are rendered tiles ('kind');
+                        # confirm_batches are render PLANS ('mode' /
+                        # 'tile_count'), counted without materialising them.
                         pages_seen = {im['page'] for im in roster_images}
                         for _b in confirm_batches:
-                            for _im in _b:
-                                pages_seen.add(_im['page'])
+                            for _p in _b:
+                                pages_seen.add(_p['page'])
                         rendered_pages_count = len(pages_seen)
                         rendered_tiles_count = (
                             sum(1 for im in roster_images
                                 if im.get('kind') == 'tile')
-                            + sum(1 for _b in confirm_batches for _im in _b
-                                  if _im.get('kind') == 'tile')
+                            + sum(_p.get('tile_count', 0)
+                                  for _b in confirm_batches for _p in _b
+                                  if _p.get('mode') == 'tiles')
                         )
                         del pages_seen
                         # page_images stays empty for the multi-pass path;
