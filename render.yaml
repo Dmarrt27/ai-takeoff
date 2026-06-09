@@ -8,7 +8,7 @@ services:
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: CLAUDE_MODEL
-        value: claude-sonnet-4-6
+        value: claude-fable-5
     disk:
       name: lessons-data
       mountPath: /data

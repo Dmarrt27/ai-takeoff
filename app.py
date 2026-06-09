@@ -64,13 +64,30 @@ _API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 client = Anthropic(api_key=_API_KEY, max_retries=4) if _API_KEY else None
 
 # Model used for analysis. Can be overridden with CLAUDE_MODEL env var.
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-fable-5")
 
-# Sampling temperature. The API defaults to 1.0 (full sampling), which makes a
-# takeoff vary run-to-run on the same drawings. 0 takes the most-probable
-# reading every time — as reproducible as the model allows, which is what a
-# measurement tool needs. Override with CLAUDE_TEMPERATURE.
+# Fable 5 and Opus 4.7+ removed sampling parameters — sending temperature/
+# top_p/top_k to them returns a 400. They also replaced fixed thinking
+# budgets with adaptive thinking. Detect once so _chat_call builds a valid
+# request whichever model CLAUDE_MODEL points at.
+_SAMPLING_REMOVED = any(s in MODEL for s in ("fable", "opus-4-7", "opus-4-8"))
+# Models that support adaptive thinking + the effort parameter.
+_SUPPORTS_ADAPTIVE = _SAMPLING_REMOVED or any(
+    s in MODEL for s in ("opus-4-6", "sonnet-4-6"))
+
+# Sampling temperature — only sent to models that still accept it. The API
+# defaults to 1.0 (full sampling), which makes a takeoff vary run-to-run on
+# the same drawings; 0 takes the most-probable reading every time. On Fable 5
+# the parameter no longer exists, so run-to-run consistency rests on the
+# skill prompt and the deterministic Python volume re-verification.
+# Override with CLAUDE_TEMPERATURE.
 TEMPERATURE = float(os.environ.get("CLAUDE_TEMPERATURE", "0"))
+
+# Reasoning effort (low|medium|high|max) for adaptive-thinking models. "high"
+# buys deeper cross-referencing of plan dimensions against sections and
+# schedules — where takeoff accuracy is won or lost. Purely an API-side knob:
+# it changes output-token spend, never render/tile memory.
+EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
 
 # Cap text sent to Claude. Construction PDFs are text-light per page, and the
 # vision tiles dominate the context budget — so this stays modest on purpose.
@@ -204,11 +221,24 @@ def _chat_call(messages, tools=None, tool_choice=None, max_tokens=16000):
     kwargs = {
         "model": MODEL,
         "max_tokens": max_tokens,
-        "temperature": TEMPERATURE,
         "system": _system_blocks(),
         "messages": messages,
         "timeout": PER_CALL_TIMEOUT,
     }
+    if not _SAMPLING_REMOVED:
+        # Older models keep the deterministic temperature; Fable 5 / Opus 4.7+
+        # reject sampling params with a 400.
+        kwargs["temperature"] = TEMPERATURE
+    if _SUPPORTS_ADAPTIVE:
+        kwargs["output_config"] = {"effort": EFFORT}
+        # Adaptive thinking is incompatible with a forced tool_choice
+        # ({"type": "tool"/"any"}), so it's only enabled on free-form calls.
+        # The forced-tool calls (triage, retry restructuring) only reformat
+        # analysis that already exists, so thinking buys nothing there anyway.
+        forced = (tool_choice is not None
+                  and tool_choice.get("type") in ("tool", "any"))
+        if not forced:
+            kwargs["thinking"] = {"type": "adaptive"}
     if tools is not None:
         kwargs["tools"] = tools
     if tool_choice is not None:
@@ -2046,7 +2076,14 @@ FINALLY: Run the Quality Checks, then call the return_takeoff tool with every co
             break
         if retry_messages is None:
             retry_messages = [{"role": "user", "content": initial}]
-        retry_messages.append({"role": "assistant", "content": resp.content})
+        # The adaptive first call may have emitted thinking blocks; the
+        # forced-tool retry runs without thinking, so those blocks can't be
+        # replayed into its history — keep only text and tool_use blocks.
+        replay = [b for b in resp.content
+                  if b.type not in ("thinking", "redacted_thinking")]
+        if not replay:
+            break
+        retry_messages.append({"role": "assistant", "content": replay})
         if tool_block:
             retry_messages.append({
                 "role": "user",
