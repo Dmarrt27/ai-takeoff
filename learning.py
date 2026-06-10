@@ -158,9 +158,16 @@ def generate_and_save_lesson(feedback_payload: dict, client, model: str, images:
             max_tokens=200,
             messages=messages,
         )
-        lesson_text = resp.content[0].text.strip()
+        # Join text blocks rather than indexing content[0] — newer models can
+        # lead the response with non-text blocks (e.g. thinking).
+        lesson_text = "".join(
+            b.text for b in resp.content if b.type == "text"
+        ).strip()
     except Exception as e:
         print(f"[learning] Lesson generation failed: {e}")
+        return False
+    if not lesson_text:
+        print("[learning] Lesson generation returned no text")
         return False
 
     ai_example, user_example, _ = corrections[0]
